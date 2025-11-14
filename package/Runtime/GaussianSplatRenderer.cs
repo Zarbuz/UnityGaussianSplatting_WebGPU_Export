@@ -10,7 +10,9 @@ using Unity.Profiling.LowLevel;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
+#if ENABLE_VR_MODULE && ENABLE_VR
 using UnityEngine.XR;
+#endif
 using Object = UnityEngine.Object;
 
 namespace GaussianSplatting.Runtime
@@ -251,8 +253,11 @@ namespace GaussianSplatting.Runtime
             // Set global shader properties that are identical for all splats this frame
             // Screen params and camera position are the same for all instances - set them once
             int screenW = cam.pixelWidth, screenH = cam.pixelHeight;
-            int eyeW = XRSettings.eyeTextureWidth, eyeH = XRSettings.eyeTextureHeight;
-            Vector4 screenPar = new Vector4(eyeW != 0 ? eyeW : screenW, eyeH != 0 ? eyeH : screenH, 0, 0);
+            int eyeW = 0, eyeH = 0;
+#if ENABLE_VR_MODULE && ENABLE_VR
+            eyeW = XRSettings.eyeTextureWidth, eyeH = XRSettings.eyeTextureHeight;
+#endif
+			Vector4 screenPar = new Vector4(eyeW != 0 ? eyeW : screenW, eyeH != 0 ? eyeH : screenH, 0, 0);
             Vector4 camPos = cam.transform.position;
             cmb.SetGlobalVector(GaussianSplatRenderer.Props.VecScreenParams, screenPar);
             cmb.SetGlobalVector(GaussianSplatRenderer.Props.VecWorldSpaceCameraPos, camPos);
