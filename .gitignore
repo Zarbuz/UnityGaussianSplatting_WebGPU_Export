@@ -25,3 +25,6 @@
 /projects/**/UserSettings/*
 /projects/**/obj/*
 *.sln.DotSettings.user
+projects/GaussianExample-URP/.vs/
+projects/GaussianExample-URP/GaussianExample-URP.slnx
+projects/GaussianExample-URP/.vsconfig

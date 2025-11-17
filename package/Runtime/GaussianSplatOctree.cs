@@ -1306,19 +1306,6 @@ namespace GaussianSplatting.Runtime
             return tasks;
         }
 
-        void JoinParallelSortThreads(Task[] tasks)
-        {
-            if (tasks == null) return;
-            try
-            {
-                Task.WaitAll(tasks);
-            }
-            catch (AggregateException ex)
-            {
-                Debug.LogError($"One or more parallel sorting tasks threw exceptions: {ex}");
-            }
-        }
-
         /// <summary>
         /// Start native sorting jobs for WebGL platform.
         /// </summary>
@@ -1542,23 +1529,6 @@ namespace GaussianSplatting.Runtime
             node.lastSortCameraPosition = camPosition;
         }
 
-        /// <summary>
-        /// Cleanup completed native jobs without applying results.
-        /// </summary>
-        void CleanupCompletedNativeJobs()
-        {
-            for (int i = m_NativeSortJobs.Count - 1; i >= 0; i--)
-            {
-                var handle = m_NativeSortJobs[i];
-                if (!handle.IsCompleted) continue;
-                try { NativeSorting.CleanupJob(handle); } catch { }
-                var info = m_NativeJobInfos[i];
-                try { if (info.disposeInput && info.inputIndices.IsCreated) info.inputIndices.Dispose(); } catch { }
-                try { if (info.sortedIndices.IsCreated) info.sortedIndices.Dispose(); } catch { }
-                m_NativeSortJobs.RemoveAt(i);
-                m_NativeJobInfos.RemoveAt(i);
-            }
-        }
 
         /// <summary>
         /// Sort splats in a node and mark it as sorted for the current camera view.
@@ -1683,31 +1653,6 @@ namespace GaussianSplatting.Runtime
                             }
                         }
                     }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Sequential fallback for nodes/outliers not handled by native jobs.
-        /// </summary>
-        void SequentialSortFallback(Vector3 camPosition)
-        {
-            // Check if outliers need sequential sorting (if not already handled by native job)
-            if (ShouldResortOutliers(camPosition))
-            {
-                SortOutliers(camPosition);
-            }
-            
-            // Check nodes that may not have been processed by native jobs
-            for (int i = 0; i < m_VisibleNodeRefs.Count; i++)
-            {
-                var nodeRef = m_VisibleNodeRefs[i];
-                var node = m_Nodes[nodeRef.nodeIndex];
-                
-                // Only process nodes that aren't already sorted
-                if (!node.isSorted && node.splatIndices != null && node.splatIndices.Count > 1)
-                {
-                    SortNodeSplats(nodeRef.nodeIndex, camPosition);
                 }
             }
         }
