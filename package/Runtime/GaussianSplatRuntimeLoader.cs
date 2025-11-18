@@ -79,10 +79,36 @@ namespace GaussianSplatting.Runtime
 
                 GaussianSplatAsset asset;
 
-                if (loadFromUrl)
+                // Auto-detect: In WebGL, StreamingAssets must be loaded via URL
+                bool shouldUseUrl = loadFromUrl;
+#if UNITY_WEBGL && !UNITY_EDITOR
+                if (sourcePathOrUrl.StartsWith("StreamingAssets", StringComparison.OrdinalIgnoreCase))
                 {
-                    Debug.Log($"Loading Gaussian Splat from URL: {sourcePathOrUrl}");
-                    asset = await GaussianSplatAssetRuntimeConverter.ConvertFromUrlAsync(sourcePathOrUrl, settings);
+                    shouldUseUrl = true;
+                }
+#endif
+
+                if (shouldUseUrl)
+                {
+                    string url = sourcePathOrUrl;
+
+                    // Convert StreamingAssets path to URL for WebGL
+#if UNITY_WEBGL && !UNITY_EDITOR
+                    if (sourcePathOrUrl.StartsWith("StreamingAssets/", StringComparison.OrdinalIgnoreCase) ||
+                        sourcePathOrUrl.StartsWith("StreamingAssets\\", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Extract relative path after "StreamingAssets/"
+                        string relativePath = sourcePathOrUrl.Substring("StreamingAssets/".Length);
+                        url = Application.streamingAssetsPath + "/" + relativePath;
+                    }
+                    else if (sourcePathOrUrl.Equals("StreamingAssets", StringComparison.OrdinalIgnoreCase))
+                    {
+                        url = Application.streamingAssetsPath;
+                    }
+#endif
+
+                    Debug.Log($"Loading Gaussian Splat from URL: {url}");
+                    asset = await GaussianSplatAssetRuntimeConverter.ConvertFromUrlAsync(url, settings);
                 }
                 else
                 {

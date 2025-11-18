@@ -146,25 +146,23 @@ namespace GaussianSplatting.Runtime
 
                 conversionSettings.progressCallback?.Invoke("Processing downloaded file", 0.3f);
 
-                // Write to a temporary file to use GaussianFileReader
-                string tempPath = Path.Combine(Application.temporaryCachePath, $"temp_splat_{Guid.NewGuid()}.ply");
-                try
-                {
-                    await File.WriteAllBytesAsync(tempPath, fileData);
-                    var asset = await ConvertFromFileAsync(tempPath, conversionSettings);
+                // Read directly from bytes - efficient on all platforms
+                string fileExtension = Path.GetExtension(new Uri(url).LocalPath);
+                conversionSettings.progressCallback?.Invoke("Reading input data", 0.05f);
+                GaussianFileReader.ReadBytes(fileData, fileExtension, out NativeArray<InputSplatData> inputSplats);
 
-                    // Set the asset name from the URL
-                    string fileName = Path.GetFileNameWithoutExtension(new Uri(url).LocalPath);
-                    asset.name = fileName;
+                if (!inputSplats.IsCreated || inputSplats.Length == 0)
+                    throw new InvalidDataException("Failed to read splat data from downloaded file");
 
-                    return asset;
-                }
-                finally
-                {
-                    // Clean up temp file
-                    if (File.Exists(tempPath))
-                        File.Delete(tempPath);
-                }
+                // Convert using the builder
+                var asset = await ConvertFromInputDataAsync(inputSplats, conversionSettings);
+
+                // Set the asset name from the URL
+                string fileName = Path.GetFileNameWithoutExtension(new Uri(url).LocalPath);
+                asset.name = fileName;
+
+                inputSplats.Dispose();
+                return asset;
             }
             catch (Exception ex)
             {

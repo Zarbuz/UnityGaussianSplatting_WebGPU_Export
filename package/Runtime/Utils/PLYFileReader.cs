@@ -22,11 +22,22 @@ namespace GaussianSplatting.Runtime.Utils
             ReadHeaderImpl(filePath, out vertexCount, out vertexStride, out attrs, fs);
         }
 
-        static void ReadHeaderImpl(string filePath, out int vertexCount, out int vertexStride, out List<(string, ElementType)> attrs, FileStream fs)
+        public static void ReadBytesHeader(byte[] data, out int vertexCount, out int vertexStride, out List<(string, ElementType)> attrs)
+        {
+            vertexCount = 0;
+            vertexStride = 0;
+            attrs = new List<(string, ElementType)>();
+            if (data == null || data.Length == 0)
+                return;
+            using var ms = new MemoryStream(data);
+            ReadHeaderImpl("memory", out vertexCount, out vertexStride, out attrs, ms);
+        }
+
+        static void ReadHeaderImpl(string sourceName, out int vertexCount, out int vertexStride, out List<(string, ElementType)> attrs, Stream stream)
         {
             // C# arrays and NativeArrays make it hard to have a "byte" array larger than 2GB :/
-            if (fs.Length >= 2 * 1024 * 1024 * 1024L)
-                throw new IOException($"PLY {filePath} read error: currently files larger than 2GB are not supported");
+            if (stream.Length >= 2 * 1024 * 1024 * 1024L)
+                throw new IOException($"PLY {sourceName} read error: currently files larger than 2GB are not supported");
 
             // read header
             vertexCount = 0;
@@ -36,7 +47,7 @@ namespace GaussianSplatting.Runtime.Utils
             bool got_binary_le = false;
             for (int lineIdx = 0; lineIdx < kMaxHeaderLines; ++lineIdx)
             {
-                var line = ReadLine(fs);
+                var line = ReadLine(stream);
                 if (line == "end_header" || line.Length == 0)
                     break;
                 var tokens = line.Split(' ');
@@ -60,7 +71,7 @@ namespace GaussianSplatting.Runtime.Utils
 
             if (!got_binary_le)
             {
-                throw new IOException($"PLY {filePath} not supported: needs to be binary, little endian PLY format");
+                throw new IOException($"PLY {sourceName} not supported: needs to be binary, little endian PLY format");
             }
         }
 
@@ -73,6 +84,17 @@ namespace GaussianSplatting.Runtime.Utils
             var readBytes = fs.Read(vertices);
             if (readBytes != vertices.Length)
                 throw new IOException($"PLY {filePath} read error, expected {vertices.Length} data bytes got {readBytes}");
+        }
+
+        public static void ReadBytes(byte[] data, out int vertexCount, out int vertexStride, out List<(string, ElementType)> attrs, out NativeArray<byte> vertices)
+        {
+            using var ms = new MemoryStream(data);
+            ReadHeaderImpl("memory", out vertexCount, out vertexStride, out attrs, ms);
+
+            vertices = new NativeArray<byte>(vertexCount * vertexStride, Allocator.Persistent);
+            var readBytes = ms.Read(vertices);
+            if (readBytes != vertices.Length)
+                throw new IOException($"PLY memory read error, expected {vertices.Length} data bytes got {readBytes}");
         }
 
         public enum ElementType
@@ -95,12 +117,12 @@ namespace GaussianSplatting.Runtime.Utils
             };
         }
 
-        static string ReadLine(FileStream fs)
+        static string ReadLine(Stream stream)
         {
             var byteBuffer = new List<byte>();
             while (true)
             {
-                int b = fs.ReadByte();
+                int b = stream.ReadByte();
                 if (b == -1 || b == '\n')
                     break;
                 byteBuffer.Add((byte)b);

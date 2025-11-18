@@ -32,17 +32,27 @@ namespace GaussianSplatting.Runtime.Utils
             ReadHeaderImpl(filePath, gz, out vertexCount, out _, out _, out _);
         }
 
-        static void ReadHeaderImpl(string filePath, Stream fs, out int vertexCount, out int shLevel, out int fractBits, out int flags)
+        public static void ReadBytesHeader(byte[] data, out int vertexCount)
+        {
+            vertexCount = 0;
+            if (data == null || data.Length == 0)
+                return;
+            using var ms = new MemoryStream(data);
+            using var gz = new GZipStream(ms, CompressionMode.Decompress);
+            ReadHeaderImpl("memory", gz, out vertexCount, out _, out _, out _);
+        }
+
+        static void ReadHeaderImpl(string sourceName, Stream stream, out int vertexCount, out int shLevel, out int fractBits, out int flags)
         {
             var header = new NativeArray<SpzHeader>(1, Allocator.Temp);
-            var readBytes = fs.Read(header.Reinterpret<byte>(16));
+            var readBytes = stream.Read(header.Reinterpret<byte>(16));
             if (readBytes != 16)
-                throw new IOException($"SPZ {filePath} read error, failed to read header");
+                throw new IOException($"SPZ {sourceName} read error, failed to read header");
 
             if (header[0].magic != 0x5053474e)
-                throw new IOException($"SPZ {filePath} read error, header magic unexpected {header[0].magic}");
+                throw new IOException($"SPZ {sourceName} read error, header magic unexpected {header[0].magic}");
             if (header[0].version != 2)
-                throw new IOException($"SPZ {filePath} read error, header version unexpected {header[0].version}");
+                throw new IOException($"SPZ {sourceName} read error, header version unexpected {header[0].version}");
 
             vertexCount = (int)header[0].numPoints;
             shLevel = (int)(header[0].sh_fracbits_flags_reserved & 0xFF);
@@ -66,14 +76,26 @@ namespace GaussianSplatting.Runtime.Utils
         {
             using var fs = File.OpenRead(filePath);
             using var gz = new GZipStream(fs, CompressionMode.Decompress);
-            ReadHeaderImpl(filePath, gz, out var splatCount, out var shLevel, out var fractBits, out var flags);
+            ReadImpl(filePath, gz, out splats);
+        }
+
+        public static void ReadBytes(byte[] data, out NativeArray<InputSplatData> splats)
+        {
+            using var ms = new MemoryStream(data);
+            using var gz = new GZipStream(ms, CompressionMode.Decompress);
+            ReadImpl("memory", gz, out splats);
+        }
+
+        static void ReadImpl(string sourceName, Stream stream, out NativeArray<InputSplatData> splats)
+        {
+            ReadHeaderImpl(sourceName, stream, out var splatCount, out var shLevel, out var fractBits, out var flags);
 
             if (splatCount < 1 || splatCount > 10_000_000) // 10M hardcoded in SPZ code
-                throw new IOException($"SPZ {filePath} read error, out of range splat count {splatCount}");
+                throw new IOException($"SPZ {sourceName} read error, out of range splat count {splatCount}");
             if (shLevel < 0 || shLevel > 3)
-                throw new IOException($"SPZ {filePath} read error, out of range SH level {shLevel}");
+                throw new IOException($"SPZ {sourceName} read error, out of range SH level {shLevel}");
             if (fractBits < 0 || fractBits > 24)
-                throw new IOException($"SPZ {filePath} read error, out of range fractional bits {fractBits}");
+                throw new IOException($"SPZ {sourceName} read error, out of range fractional bits {fractBits}");
 
             // allocate temporary storage
             int shCoeffs = SHCoeffsForLevel(shLevel);
@@ -86,12 +108,12 @@ namespace GaussianSplatting.Runtime.Utils
 
             // read file contents into temporaries
             bool readOk = true;
-            readOk &= gz.Read(packedPos) == packedPos.Length;
-            readOk &= gz.Read(packedAlpha) == packedAlpha.Length;
-            readOk &= gz.Read(packedCol) == packedCol.Length;
-            readOk &= gz.Read(packedScale) == packedScale.Length;
-            readOk &= gz.Read(packedRot) == packedRot.Length;
-            readOk &= gz.Read(packedSh) == packedSh.Length;
+            readOk &= stream.Read(packedPos) == packedPos.Length;
+            readOk &= stream.Read(packedAlpha) == packedAlpha.Length;
+            readOk &= stream.Read(packedCol) == packedCol.Length;
+            readOk &= stream.Read(packedScale) == packedScale.Length;
+            readOk &= stream.Read(packedRot) == packedRot.Length;
+            readOk &= stream.Read(packedSh) == packedSh.Length;
 
             // unpack into full splat data
             splats = new NativeArray<InputSplatData>(splatCount, Allocator.Persistent);
@@ -118,7 +140,7 @@ namespace GaussianSplatting.Runtime.Utils
             if (!readOk)
             {
                 splats.Dispose();
-                throw new IOException($"SPZ {filePath} read error, file smaller than it should be");
+                throw new IOException($"SPZ {sourceName} read error, file smaller than it should be");
             }
         }
 

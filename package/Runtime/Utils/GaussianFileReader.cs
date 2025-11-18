@@ -50,7 +50,7 @@ namespace GaussianSplatting.Runtime.Utils
                 if (!string.IsNullOrEmpty(attrError))
                     throw new IOException($"PLY file is probably not a Gaussian Splat file? Missing properties: {attrError}");
                 splats = PLYDataToSplats(plyRawData, splatCount, vertexStride, attributes);
-                
+
                 int shCount = 15;   //default 15
                 // Count how many f_rest_* attributes are present
                 int restCount = attributes.Count(a => a.Item1.StartsWith("f_rest_") && a.Item2 == PLYFileReader.ElementType.Float);
@@ -67,8 +67,36 @@ namespace GaussianSplatting.Runtime.Utils
             throw new IOException($"File {filePath} is not a supported format");
         }
 
+        public static unsafe void ReadBytes(byte[] data, string fileExtension, out NativeArray<InputSplatData> splats)
+        {
+            if (isPLYExtension(fileExtension))
+            {
+                PLYFileReader.ReadBytes(data, out var splatCount, out var vertexStride, out List<(string, PLYFileReader.ElementType)> attributes, out NativeArray<byte> plyRawData);
+                string attrError = CheckPLYAttributes(attributes);
+                if (!string.IsNullOrEmpty(attrError))
+                    throw new IOException($"PLY data is probably not a Gaussian Splat file? Missing properties: {attrError}");
+                splats = PLYDataToSplats(plyRawData, splatCount, vertexStride, attributes);
+
+                int shCount = 15;   //default 15
+                // Count how many f_rest_* attributes are present
+                int restCount = attributes.Count(a => a.Item1.StartsWith("f_rest_") && a.Item2 == PLYFileReader.ElementType.Float);
+                shCount = restCount / 3; // Each SH band per channel (R,G,B)
+                ReorderSHs(splatCount, (float*)splats.GetUnsafePtr(), shCount);
+                LinearizeData(splats);
+                return;
+            }
+            if (isSPZExtension(fileExtension))
+            {
+                SPZFileReader.ReadBytes(data, out splats);
+                return;
+            }
+            throw new IOException($"File extension {fileExtension} is not a supported format");
+        }
+
         static bool isPLY(string filePath) => filePath.EndsWith(".ply", true, CultureInfo.InvariantCulture);
         static bool isSPZ(string filePath) => filePath.EndsWith(".spz", true, CultureInfo.InvariantCulture);
+        static bool isPLYExtension(string ext) => ext.Equals(".ply", System.StringComparison.OrdinalIgnoreCase) || ext.Equals("ply", System.StringComparison.OrdinalIgnoreCase);
+        static bool isSPZExtension(string ext) => ext.Equals(".spz", System.StringComparison.OrdinalIgnoreCase) || ext.Equals("spz", System.StringComparison.OrdinalIgnoreCase);
 
         static string CheckPLYAttributes(List<(string, PLYFileReader.ElementType)> attributes)
         {

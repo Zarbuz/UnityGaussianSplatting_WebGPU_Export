@@ -457,8 +457,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: e9bae2a0215f7bf449176f48a943ca76, type: 3}
   m_Name: 
   m_EditorClassIdentifier: GaussianSplatting::GaussianSplatting.Runtime.GaussianSplatRuntimeLoader
-  loadFromUrl: 1
-  sourcePathOrUrl: https://dev2.teemew.com/data/GaussianSplatsData/c21d2570.ply
+  loadFromUrl: 0
+  sourcePathOrUrl: StreamingAssets/c21d2570.ply
   loadOnStart: 1
   quality: 2
   isLoading: 0
