@@ -458,8 +458,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: GaussianSplatting::GaussianSplatting.Runtime.GaussianSplatRuntimeLoader
   loadFromUrl: 0
-  sourcePathOrUrl: StreamingAssets/c21d2570.ply
+  sourcePathOrUrl: StreamingAssets/export.gsplat
   loadOnStart: 1
+  useInternalFormat: 1
+  exportAfterConversion: 0
+  exportPath: Assets/StreamingAssets/export.gsplat
   quality: 2
   isLoading: 0
   loadingStatus: 

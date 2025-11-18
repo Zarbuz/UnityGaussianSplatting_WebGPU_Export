@@ -17,13 +17,23 @@ namespace GaussianSplatting.Runtime
         [Tooltip("Load from a file path or URL")]
         public bool loadFromUrl = false;
 
-        [Tooltip("File path (local) or URL to load the PLY/SPZ file from")]
+        [Tooltip("File path (local) or URL to load from. Supports PLY, SPZ, and .gsplat (internal format)")]
         public string sourcePathOrUrl = "";
 
         [Tooltip("Load automatically on Start")]
         public bool loadOnStart = true;
 
-        [Header("Quality Settings")]
+        [Header("Format Options")]
+        [Tooltip("Use internal .gsplat format (fast) or convert from PLY/SPZ (slower but universal)")]
+        public bool useInternalFormat = false;
+
+        [Tooltip("If converting from PLY/SPZ, export to .gsplat for faster subsequent loads")]
+        public bool exportAfterConversion = false;
+
+        [Tooltip("Path to export .gsplat file (only used if exportAfterConversion is true). Leave empty to auto-generate.")]
+        public string exportPath = "";
+
+        [Header("Quality Settings (PLY/SPZ conversion only)")]
         [Tooltip("Quality preset for the conversion")]
         public GaussianSplatAssetBuilder.DataQuality quality = GaussianSplatAssetBuilder.DataQuality.Medium;
 
@@ -74,9 +84,6 @@ namespace GaussianSplatting.Runtime
 
             try
             {
-                var settings = GaussianSplatAssetRuntimeConverter.ConversionSettings.FromQuality(quality);
-                settings.progressCallback = OnProgress;
-
                 GaussianSplatAsset asset;
 
                 // Auto-detect: In WebGL, StreamingAssets must be loaded via URL
@@ -88,32 +95,69 @@ namespace GaussianSplatting.Runtime
                 }
 #endif
 
-                if (shouldUseUrl)
+                // Resolve path/URL for StreamingAssets
+                string resolvedSource = sourcePathOrUrl;
+                if (sourcePathOrUrl.StartsWith("StreamingAssets/", StringComparison.OrdinalIgnoreCase))
                 {
-                    string url = sourcePathOrUrl;
+                    // Extract relative path after "StreamingAssets/"
+                    string relativePath = sourcePathOrUrl.Substring("StreamingAssets/".Length);
+                    resolvedSource = Application.streamingAssetsPath + "/" + relativePath;
+                }
 
-                    // Convert StreamingAssets path to URL for WebGL
-#if UNITY_WEBGL && !UNITY_EDITOR
-                    if (sourcePathOrUrl.StartsWith("StreamingAssets/", StringComparison.OrdinalIgnoreCase) ||
-                        sourcePathOrUrl.StartsWith("StreamingAssets\\", StringComparison.OrdinalIgnoreCase))
-                    {
-                        // Extract relative path after "StreamingAssets/"
-                        string relativePath = sourcePathOrUrl.Substring("StreamingAssets/".Length);
-                        url = Application.streamingAssetsPath + "/" + relativePath;
-                    }
-                    else if (sourcePathOrUrl.Equals("StreamingAssets", StringComparison.OrdinalIgnoreCase))
-                    {
-                        url = Application.streamingAssetsPath;
-                    }
-#endif
+                // Check if using internal .gsplat format
+                if (useInternalFormat)
+                {
+                    loadingStatus = "Loading internal format...";
+                    Debug.Log($"Loading .gsplat from: {resolvedSource}");
 
-                    Debug.Log($"Loading Gaussian Splat from URL: {url}");
-                    asset = await GaussianSplatAssetRuntimeConverter.ConvertFromUrlAsync(url, settings);
+                    // For URLs (including WebGL StreamingAssets), download and import from bytes
+                    if (shouldUseUrl)
+                    {
+                        loadingStatus = "Downloading .gsplat file...";
+                        byte[] fileData = await DownloadFileAsync(resolvedSource);
+
+                        loadingStatus = "Importing .gsplat data...";
+                        string assetName = System.IO.Path.GetFileNameWithoutExtension(sourcePathOrUrl);
+                        asset = await GaussianSplatAssetRuntimeConverter.ImportAssetFromBytesAsync(fileData, assetName);
+                    }
+                    else
+                    {
+                        // Local file - can import directly
+                        asset = await GaussianSplatAssetRuntimeConverter.ImportAssetAsync(resolvedSource);
+                    }
                 }
                 else
                 {
-                    Debug.Log($"Loading Gaussian Splat from file: {sourcePathOrUrl}");
-                    asset = await GaussianSplatAssetRuntimeConverter.ConvertFromFileAsync(sourcePathOrUrl, settings);
+                    // Converting from PLY/SPZ
+                    var settings = GaussianSplatAssetRuntimeConverter.ConversionSettings.FromQuality(quality);
+                    settings.progressCallback = OnProgress;
+
+                    if (shouldUseUrl)
+                    {
+                        Debug.Log($"Converting Gaussian Splat from URL: {resolvedSource}");
+                        asset = await GaussianSplatAssetRuntimeConverter.ConvertFromUrlAsync(resolvedSource, settings);
+                    }
+                    else
+                    {
+                        Debug.Log($"Converting Gaussian Splat from file: {resolvedSource}");
+                        asset = await GaussianSplatAssetRuntimeConverter.ConvertFromFileAsync(resolvedSource, settings);
+                    }
+
+                    // Export to .gsplat if requested
+                    if (asset != null && exportAfterConversion)
+                    {
+                        string outputPath = exportPath;
+                        if (string.IsNullOrEmpty(outputPath))
+                        {
+                            // Auto-generate export path in PersistentDataPath
+                            string filename = System.IO.Path.GetFileNameWithoutExtension(sourcePathOrUrl);
+                            outputPath = System.IO.Path.Combine(Application.persistentDataPath, $"{filename}.gsplat");
+                        }
+
+                        loadingStatus = "Exporting internal format...";
+                        Debug.Log($"Exporting to .gsplat: {outputPath}");
+                        await GaussianSplatAssetRuntimeConverter.ExportAssetAsync(asset, outputPath);
+                    }
                 }
 
                 if (asset != null)
@@ -161,10 +205,35 @@ namespace GaussianSplatting.Runtime
 
         private bool OnProgress(string message, float progress)
         {
-			Debug.Log("[GaussianSplatRuntimeLoader] " + message + " " + progress);
+            Debug.Log("[GaussianSplatRuntimeLoader] " + message + " " + progress);
             loadingStatus = message;
             loadingProgress = progress;
             return true; // Return false to cancel
+        }
+
+        /// <summary>
+        /// Downloads a file from a URL asynchronously.
+        /// </summary>
+        private async Task<byte[]> DownloadFileAsync(string url)
+        {
+            using (UnityEngine.Networking.UnityWebRequest request = UnityEngine.Networking.UnityWebRequest.Get(url))
+            {
+                var operation = request.SendWebRequest();
+
+                while (!operation.isDone)
+                {
+                    loadingProgress = operation.progress * 0.3f; // Use first 30% for download
+                    await Task.Yield();
+                }
+
+                if (request.result != UnityEngine.Networking.UnityWebRequest.Result.Success)
+                {
+                    throw new Exception($"Failed to download file from {url}: {request.error}");
+                }
+
+                loadingProgress = 0.3f;
+                return request.downloadHandler.data;
+            }
         }
 
         void OnValidate()

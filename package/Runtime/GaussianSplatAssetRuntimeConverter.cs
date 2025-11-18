@@ -7,6 +7,7 @@ using Unity.Collections;
 using UnityEngine;
 using UnityEngine.Networking;
 using GaussianSplatting.Runtime.Utils;
+using Unity.Collections.LowLevel.Unsafe;
 
 namespace GaussianSplatting.Runtime
 {
@@ -321,6 +322,184 @@ namespace GaussianSplatting.Runtime
             // If not found in StreamingAssets, treat as relative to current directory
             // or return the original path and let the caller handle the error
             return Path.GetFullPath(filePath);
+        }
+
+        /// <summary>
+        /// Exports a runtime GaussianSplatAsset to a binary file.
+        /// This allows fast loading without re-conversion from PLY/SPZ.
+        /// File format: Header + metadata + 5 data chunks (chunk, pos, other, color, sh)
+        /// </summary>
+        /// <param name="asset">The asset to export (must have runtime data)</param>
+        /// <param name="outputPath">Output file path (.gsplat extension recommended)</param>
+        public static async Task ExportAssetAsync(GaussianSplatAsset asset, string outputPath)
+        {
+            if (asset == null)
+                throw new ArgumentNullException(nameof(asset));
+
+            if (!asset.m_RuntimePosData.IsCreated)
+                throw new InvalidOperationException("Asset has no runtime data to export. Only runtime-loaded assets can be exported.");
+
+            using (var fileStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write))
+            using (var writer = new BinaryWriter(fileStream))
+            {
+                // Write magic number and version
+                writer.Write(0x4C504753); // "GSPL" magic
+                writer.Write(1); // Format version
+
+                // Write metadata
+                writer.Write(asset.formatVersion);
+                writer.Write(asset.splatCount);
+                writer.Write(asset.boundsMin.x);
+                writer.Write(asset.boundsMin.y);
+                writer.Write(asset.boundsMin.z);
+                writer.Write(asset.boundsMax.x);
+                writer.Write(asset.boundsMax.y);
+                writer.Write(asset.boundsMax.z);
+                writer.Write((int)asset.posFormat);
+                writer.Write((int)asset.scaleFormat);
+                writer.Write((int)asset.colorFormat);
+                writer.Write((int)asset.shFormat);
+
+                // Write data hash
+                unsafe
+                {
+                    Hash128 hash = asset.dataHash;
+                    byte* hashPtr = (byte*)&hash;
+                    for (int i = 0; i < 16; i++)
+                        writer.Write(hashPtr[i]);
+                }
+
+                // Helper to write NativeArray<byte>
+                unsafe void WriteDataChunk(NativeArray<byte> data)
+                {
+                    writer.Write(data.Length);
+                    if (data.Length > 0)
+                    {
+                        byte* ptr = (byte*)data.GetUnsafeReadOnlyPtr();
+                        for (int i = 0; i < data.Length; i++)
+                            writer.Write(ptr[i]);
+                    }
+                }
+
+                // Write all data chunks
+                WriteDataChunk(asset.m_RuntimeChunkData.IsCreated ? asset.m_RuntimeChunkData : default);
+                await Task.Yield(); // Allow GC
+
+                WriteDataChunk(asset.m_RuntimePosData);
+                await Task.Yield();
+
+                WriteDataChunk(asset.m_RuntimeOtherData);
+                await Task.Yield();
+
+                WriteDataChunk(asset.m_RuntimeColorData);
+                await Task.Yield();
+
+                WriteDataChunk(asset.m_RuntimeSHData);
+                await Task.Yield();
+            }
+
+            Debug.Log($"Exported GaussianSplatAsset to {outputPath} ({new FileInfo(outputPath).Length} bytes)");
+        }
+
+        /// <summary>
+        /// Imports a GaussianSplatAsset from an exported binary file.
+        /// This is much faster than converting from PLY/SPZ as the data is already in the optimized format.
+        /// </summary>
+        /// <param name="filePath">Path to the exported .gsplat file</param>
+        /// <returns>A GaussianSplatAsset ready to use at runtime</returns>
+        public static async Task<GaussianSplatAsset> ImportAssetAsync(string filePath)
+        {
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException($"File not found: {filePath}");
+
+            byte[] fileData = await File.ReadAllBytesAsync(filePath);
+            return await ImportAssetFromBytesAsync(fileData, Path.GetFileNameWithoutExtension(filePath));
+        }
+
+        /// <summary>
+        /// Imports a GaussianSplatAsset from byte array.
+        /// This is much faster than converting from PLY/SPZ as the data is already in the optimized format.
+        /// </summary>
+        /// <param name="data">Byte array containing .gsplat file data</param>
+        /// <param name="assetName">Optional name for the asset</param>
+        /// <returns>A GaussianSplatAsset ready to use at runtime</returns>
+        public static async Task<GaussianSplatAsset> ImportAssetFromBytesAsync(byte[] data, string assetName = "ImportedAsset")
+        {
+            if (data == null || data.Length == 0)
+                throw new ArgumentException("Data is null or empty");
+
+            using (var memoryStream = new MemoryStream(data))
+            using (var reader = new BinaryReader(memoryStream))
+            {
+                // Read and validate magic number
+                uint magic = reader.ReadUInt32();
+                if (magic != 0x4C504753) // "GSPL"
+                    throw new InvalidDataException($"Invalid file format. Expected GSPL magic, got 0x{magic:X8}");
+
+                // Read format version
+                int formatVersion = reader.ReadInt32();
+                if (formatVersion != 1)
+                    throw new InvalidDataException($"Unsupported format version {formatVersion}");
+
+                // Read metadata
+                int assetFormatVersion = reader.ReadInt32();
+                int splatCount = reader.ReadInt32();
+                Vector3 boundsMin = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                Vector3 boundsMax = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                var posFormat = (GaussianSplatAsset.VectorFormat)reader.ReadInt32();
+                var scaleFormat = (GaussianSplatAsset.VectorFormat)reader.ReadInt32();
+                var colorFormat = (GaussianSplatAsset.ColorFormat)reader.ReadInt32();
+                var shFormat = (GaussianSplatAsset.SHFormat)reader.ReadInt32();
+
+                // Read data hash
+                Hash128 dataHash;
+                unsafe
+                {
+                    byte* hashPtr = (byte*)&dataHash;
+                    for (int i = 0; i < 16; i++)
+                        hashPtr[i] = reader.ReadByte();
+                }
+
+                // Helper to read NativeArray<byte>
+                unsafe NativeArray<byte> ReadDataChunk()
+                {
+                    int length = reader.ReadInt32();
+                    if (length == 0)
+                        return default;
+
+                    var array = new NativeArray<byte>(length, Allocator.Persistent);
+                    byte* ptr = (byte*)array.GetUnsafePtr();
+                    for (int i = 0; i < length; i++)
+                        ptr[i] = reader.ReadByte();
+                    return array;
+                }
+
+                // Read all data chunks
+                var chunkData = ReadDataChunk();
+                await Task.Yield();
+
+                var posData = ReadDataChunk();
+                await Task.Yield();
+
+                var otherData = ReadDataChunk();
+                await Task.Yield();
+
+                var colorData = ReadDataChunk();
+                await Task.Yield();
+
+                var shData = ReadDataChunk();
+                await Task.Yield();
+
+                // Create and populate the asset
+                var asset = ScriptableObject.CreateInstance<GaussianSplatAsset>();
+                asset.name = assetName;
+                asset.Initialize(splatCount, posFormat, scaleFormat, colorFormat, shFormat, boundsMin, boundsMax, null);
+                asset.SetDataHash(dataHash);
+                asset.SetRuntimeData(chunkData, posData, otherData, colorData, shData);
+
+                Debug.Log($"Imported GaussianSplatAsset '{assetName}' ({splatCount} splats)");
+                return asset;
+            }
         }
     }
 }
