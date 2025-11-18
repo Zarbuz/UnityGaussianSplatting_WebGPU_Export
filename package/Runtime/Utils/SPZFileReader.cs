@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 using System.IO;
-using Unity.Collections;
 using System.IO.Compression;
-using GaussianSplatting.Runtime;
 using Unity.Burst;
+using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 
-namespace GaussianSplatting.Editor.Utils
+namespace GaussianSplatting.Runtime.Utils
 {
     // reads Niantic/Scaniverse .SPZ files:
     // https://github.com/nianticlabs/spz
