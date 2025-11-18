@@ -185,8 +185,9 @@ namespace GaussianSplatting.Runtime
             if (!inputSplats.IsCreated || inputSplats.Length == 0)
                 throw new ArgumentException("Input splats array is empty or not created");
 
-            // Build result to be disposed in finally block
+            // Build result to be disposed in finally block if error occurs
             GaussianSplatAssetBuilder.BuildResult buildResult = default;
+            bool ownershipTransferred = false;
 
             try
             {
@@ -218,30 +219,20 @@ namespace GaussianSplatting.Runtime
                 );
                 asset.SetDataHash(buildResult.dataHash);
 
-                // Set the runtime data (convert NativeArray to byte[])
-                // For WebGL, yield between conversions to allow GC
-                byte[] chunkData = buildResult.chunkData.IsCreated ? buildResult.chunkData.ToArray() : null;
-                await Task.Yield();
+                // Set the runtime data directly - no conversion needed!
+                // Asset takes ownership of the NativeArrays, so we don't dispose them
+                asset.SetRuntimeData(
+                    buildResult.chunkData,
+                    buildResult.posData,
+                    buildResult.otherData,
+                    buildResult.colorData,
+                    buildResult.shData
+                );
 
-                byte[] posData = buildResult.posData.ToArray();
-                await Task.Yield();
+                // Mark ownership as transferred - asset will dispose the arrays
+                ownershipTransferred = true;
 
-                byte[] otherData = buildResult.otherData.ToArray();
-                await Task.Yield();
-
-                byte[] colorData = buildResult.colorData.ToArray();
-                await Task.Yield();
-
-                byte[] shData = buildResult.shData.ToArray();
-                await Task.Yield();
-
-                asset.SetRuntimeData(chunkData, posData, otherData, colorData, shData);
-
-                // Clean up build result BEFORE yielding to allow memory to be freed
-                buildResult.Dispose();
-                buildResult = default;
-
-                // Force a yield to allow GC to collect the disposed NativeArrays
+                // Just yield to allow other work
                 await Task.Yield();
 
                 WrappedProgress("Conversion complete", 1.0f);
@@ -255,8 +246,8 @@ namespace GaussianSplatting.Runtime
             }
             finally
             {
-                // Ensure build result is disposed even if an error occurs
-                if (buildResult.posData.IsCreated)
+                // Only dispose if ownership was not transferred (i.e., error occurred before SetRuntimeData)
+                if (!ownershipTransferred && buildResult.posData.IsCreated)
                     buildResult.Dispose();
             }
         }

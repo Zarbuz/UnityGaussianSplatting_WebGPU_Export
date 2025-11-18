@@ -287,10 +287,47 @@ namespace GaussianSplatting.Runtime
             order.Schedule(splatData.Length, 4096).Complete();
             order.m_Order.Sort(new OrderComparer());
 
-            NativeArray<InputSplatData> copy = new(order.m_SplatData, Allocator.TempJob);
-            for (int i = 0; i < copy.Length; ++i)
-                order.m_SplatData[i] = copy[order.m_Order[i].Item2];
-            copy.Dispose();
+            // In-place cyclic permutation using negative indices to mark visited elements
+            // This avoids allocating a separate visited array
+            for (int i = 0; i < splatData.Length; ++i)
+            {
+                int targetIdx = order.m_Order[i].Item2;
+
+                // Already visited (marked as negative)
+                if (targetIdx < 0)
+                    continue;
+
+                // Skip if already in correct position
+                if (targetIdx == i)
+                {
+                    order.m_Order[i] = (order.m_Order[i].Item1, -1 - targetIdx);
+                    continue;
+                }
+
+                // Save the first element in the cycle
+                InputSplatData temp = splatData[i];
+                int currentIdx = i;
+
+                // Follow the cycle
+                while (true)
+                {
+                    int nextIdx = order.m_Order[currentIdx].Item2;
+
+                    // Mark as visited by negating (store as -1 - index to handle index 0)
+                    order.m_Order[currentIdx] = (order.m_Order[currentIdx].Item1, -1 - nextIdx);
+
+                    if (nextIdx == i)
+                    {
+                        // Close the cycle
+                        splatData[currentIdx] = temp;
+                        break;
+                    }
+
+                    // Move element
+                    splatData[currentIdx] = splatData[nextIdx];
+                    currentIdx = nextIdx;
+                }
+            }
 
             order.m_Order.Dispose();
         }
