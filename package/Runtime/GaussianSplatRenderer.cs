@@ -596,10 +596,11 @@ namespace GaussianSplatting.Runtime
             m_Asset != null &&
             m_Asset.splatCount > 0 &&
             m_Asset.formatVersion == GaussianSplatAsset.kCurrentVersion &&
-            m_Asset.posData != null &&
-            m_Asset.otherData != null &&
-            m_Asset.shData != null &&
-            m_Asset.colorData != null;
+            // Check if data is available either from TextAsset or runtime arrays
+            (m_Asset.posData != null || m_Asset.m_RuntimePosData != null) &&
+            (m_Asset.otherData != null || m_Asset.m_RuntimeOtherData != null) &&
+            (m_Asset.shData != null || m_Asset.m_RuntimeSHData != null) &&
+            (m_Asset.colorData != null || m_Asset.m_RuntimeColorData != null);
         public bool HasValidRenderSetup => m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null;
 
         /// <summary>
@@ -641,8 +642,8 @@ namespace GaussianSplatting.Runtime
 
             // PosData - dispose temp array immediately, then yield
             {
-                m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
-                var tempData = asset.posData.GetData<uint>();
+                m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.GetPosDataSize() / 4), 4) { name = "GaussianPosData" };
+                var tempData = asset.GetPosData<uint>();
                 m_GpuPosData.SetData(tempData);
                 tempData.Dispose();
             }
@@ -650,8 +651,8 @@ namespace GaussianSplatting.Runtime
 
             // OtherData - dispose temp array immediately, then yield
             {
-                m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
-                var tempData = asset.otherData.GetData<uint>();
+                m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.GetOtherDataSize() / 4), 4) { name = "GaussianOtherData" };
+                var tempData = asset.GetOtherData<uint>();
                 m_GpuOtherData.SetData(tempData);
                 tempData.Dispose();
             }
@@ -659,8 +660,8 @@ namespace GaussianSplatting.Runtime
 
             // SHData - dispose temp array immediately, then yield
             {
-                m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
-                var tempData = asset.shData.GetData<uint>();
+                m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.GetSHDataSize() / 4), 4) { name = "GaussianSHData" };
+                var tempData = asset.GetSHData<uint>();
                 m_GpuSHData.SetData(tempData);
                 tempData.Dispose();
             }
@@ -671,7 +672,7 @@ namespace GaussianSplatting.Runtime
                 var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
                 var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
                 var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.None) { name = "GaussianColorData" };
-                var tempData = asset.colorData.GetData<byte>();
+                var tempData = asset.GetColorData<byte>();
                 tex.SetPixelData(tempData, 0);
                 tex.Apply(false, true);
                 tempData.Dispose();
@@ -680,12 +681,13 @@ namespace GaussianSplatting.Runtime
             await Task.Yield(); // Allow GC to run
 
             // ChunkData - dispose temp array immediately
-            if (asset.chunkData != null && asset.chunkData.dataSize != 0)
+            long chunkDataSize = asset.GetChunkDataSize();
+            if (chunkDataSize != 0)
             {
                 m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Vertex,
-                    (int)(asset.chunkData.dataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
+                    (int)(chunkDataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
                     UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
-                var tempData = asset.chunkData.GetData<GaussianSplatAsset.ChunkInfo>();
+                var tempData = asset.GetChunkData<GaussianSplatAsset.ChunkInfo>();
                 m_GpuChunks.SetData(tempData);
                 tempData.Dispose();
                 m_GpuChunksValid = true;
@@ -982,10 +984,11 @@ namespace GaussianSplatting.Runtime
                 m_Octree.Initialize(settings.m_OctreeMaxDepth, settings.m_OctreeMaxSplatsPerLeaf);
 
                 // Pass worldSplatPositions to octree (octree takes ownership, don't dispose!)
-                await m_Octree.BuildAsync(worldSplatPositions, bounds, settings.m_OctreeSplatRatio);
-
-                // Mark as default since octree now owns it
+                // Mark as default BEFORE the async call to prevent finally block from disposing it
+                var octreePositions = worldSplatPositions;
                 worldSplatPositions = default;
+
+                await m_Octree.BuildAsync(octreePositions, bounds, settings.m_OctreeSplatRatio);
 
                 m_OctreeBuilt = true;
 
@@ -1028,8 +1031,8 @@ namespace GaussianSplatting.Runtime
 
             try
             {
-                posData = asset.posData.GetData<uint>();
-                chunkData = asset.chunkData?.GetData<GaussianSplatAsset.ChunkInfo>() ?? default;
+                posData = asset.GetPosData<uint>();
+                chunkData = asset.GetChunkData<GaussianSplatAsset.ChunkInfo>();
 
                 int vectorSize = GaussianSplatAsset.GetVectorSize(asset.posFormat);
 

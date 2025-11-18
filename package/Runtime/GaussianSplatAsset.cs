@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 using System;
+using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using UnityEngine;
@@ -125,6 +126,184 @@ namespace GaussianSplatting.Runtime
             m_OtherData = dataOther;
             m_ColorData = dataColor;
             m_SHData = dataSh;
+        }
+
+        // Runtime data holder for assets loaded at runtime without TextAsset
+        [System.NonSerialized] internal byte[] m_RuntimeChunkData;
+        [System.NonSerialized] internal byte[] m_RuntimePosData;
+        [System.NonSerialized] internal byte[] m_RuntimeOtherData;
+        [System.NonSerialized] internal byte[] m_RuntimeColorData;
+        [System.NonSerialized] internal byte[] m_RuntimeSHData;
+
+        /// <summary>
+        /// Sets raw binary data for runtime-loaded assets that don't have TextAsset references.
+        /// This allows GaussianSplatAsset to be created and populated at runtime.
+        /// </summary>
+        public void SetRuntimeData(byte[] dataChunk, byte[] dataPos, byte[] dataOther, byte[] dataColor, byte[] dataSh)
+        {
+            m_RuntimeChunkData = dataChunk;
+            m_RuntimePosData = dataPos;
+            m_RuntimeOtherData = dataOther;
+            m_RuntimeColorData = dataColor;
+            m_RuntimeSHData = dataSh;
+        }
+
+        /// <summary>
+        /// Gets position data as a NativeArray, supporting both TextAsset and runtime data sources.
+        /// Caller is responsible for disposing the returned array.
+        /// </summary>
+        public NativeArray<T> GetPosData<T>() where T : struct
+        {
+            if (m_RuntimePosData != null)
+            {
+                var result = new NativeArray<T>(m_RuntimePosData.Length / UnsafeUtility.SizeOf<T>(), Allocator.TempJob);
+                unsafe
+                {
+                    fixed (byte* src = m_RuntimePosData)
+                    {
+                        UnsafeUtility.MemCpy(result.GetUnsafePtr(), src, m_RuntimePosData.Length);
+                    }
+                }
+                return result;
+            }
+            return m_PosData.GetData<T>();
+        }
+
+        /// <summary>
+        /// Gets other data as a NativeArray, supporting both TextAsset and runtime data sources.
+        /// Caller is responsible for disposing the returned array.
+        /// </summary>
+        public NativeArray<T> GetOtherData<T>() where T : struct
+        {
+            if (m_RuntimeOtherData != null)
+            {
+                var result = new NativeArray<T>(m_RuntimeOtherData.Length / UnsafeUtility.SizeOf<T>(), Allocator.TempJob);
+                unsafe
+                {
+                    fixed (byte* src = m_RuntimeOtherData)
+                    {
+                        UnsafeUtility.MemCpy(result.GetUnsafePtr(), src, m_RuntimeOtherData.Length);
+                    }
+                }
+                return result;
+            }
+            return m_OtherData.GetData<T>();
+        }
+
+        /// <summary>
+        /// Gets SH data as a NativeArray, supporting both TextAsset and runtime data sources.
+        /// Caller is responsible for disposing the returned array.
+        /// </summary>
+        public NativeArray<T> GetSHData<T>() where T : struct
+        {
+            if (m_RuntimeSHData != null)
+            {
+                var result = new NativeArray<T>(m_RuntimeSHData.Length / UnsafeUtility.SizeOf<T>(), Allocator.TempJob);
+                unsafe
+                {
+                    fixed (byte* src = m_RuntimeSHData)
+                    {
+                        UnsafeUtility.MemCpy(result.GetUnsafePtr(), src, m_RuntimeSHData.Length);
+                    }
+                }
+                return result;
+            }
+            return m_SHData.GetData<T>();
+        }
+
+        /// <summary>
+        /// Gets color data as a NativeArray, supporting both TextAsset and runtime data sources.
+        /// Caller is responsible for disposing the returned array.
+        /// </summary>
+        public NativeArray<T> GetColorData<T>() where T : struct
+        {
+            if (m_RuntimeColorData != null)
+            {
+                var result = new NativeArray<T>(m_RuntimeColorData.Length / UnsafeUtility.SizeOf<T>(), Allocator.TempJob);
+                unsafe
+                {
+                    fixed (byte* src = m_RuntimeColorData)
+                    {
+                        UnsafeUtility.MemCpy(result.GetUnsafePtr(), src, m_RuntimeColorData.Length);
+                    }
+                }
+                return result;
+            }
+            return m_ColorData.GetData<T>();
+        }
+
+        /// <summary>
+        /// Gets chunk data as a NativeArray, supporting both TextAsset and runtime data sources.
+        /// Caller is responsible for disposing the returned array.
+        /// Returns default if no chunk data is available.
+        /// </summary>
+        public NativeArray<T> GetChunkData<T>() where T : struct
+        {
+            if (m_RuntimeChunkData != null)
+            {
+                var result = new NativeArray<T>(m_RuntimeChunkData.Length / UnsafeUtility.SizeOf<T>(), Allocator.TempJob);
+                unsafe
+                {
+                    fixed (byte* src = m_RuntimeChunkData)
+                    {
+                        UnsafeUtility.MemCpy(result.GetUnsafePtr(), src, m_RuntimeChunkData.Length);
+                    }
+                }
+                return result;
+            }
+            if (m_ChunkData != null)
+                return m_ChunkData.GetData<T>();
+            return default;
+        }
+
+        /// <summary>
+        /// Gets the size of position data in bytes.
+        /// </summary>
+        public long GetPosDataSize()
+        {
+            if (m_RuntimePosData != null)
+                return m_RuntimePosData.Length;
+            return m_PosData != null ? m_PosData.dataSize : 0;
+        }
+
+        /// <summary>
+        /// Gets the size of other data in bytes.
+        /// </summary>
+        public long GetOtherDataSize()
+        {
+            if (m_RuntimeOtherData != null)
+                return m_RuntimeOtherData.Length;
+            return m_OtherData != null ? m_OtherData.dataSize : 0;
+        }
+
+        /// <summary>
+        /// Gets the size of SH data in bytes.
+        /// </summary>
+        public long GetSHDataSize()
+        {
+            if (m_RuntimeSHData != null)
+                return m_RuntimeSHData.Length;
+            return m_SHData != null ? m_SHData.dataSize : 0;
+        }
+
+        /// <summary>
+        /// Gets the size of color data in bytes.
+        /// </summary>
+        public long GetColorDataSize()
+        {
+            if (m_RuntimeColorData != null)
+                return m_RuntimeColorData.Length;
+            return m_ColorData != null ? m_ColorData.dataSize : 0;
+        }
+
+        /// <summary>
+        /// Gets the size of chunk data in bytes.
+        /// </summary>
+        public long GetChunkDataSize()
+        {
+            if (m_RuntimeChunkData != null)
+                return m_RuntimeChunkData.Length;
+            return m_ChunkData != null ? m_ChunkData.dataSize : 0;
         }
 
         public static int GetOtherSizeNoSHIndex(VectorFormat scaleFormat)

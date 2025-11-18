@@ -45,9 +45,7 @@ namespace GaussianSplatting.Runtime.Utils
         {
             if (isPLY(filePath))
             {
-                NativeArray<byte> plyRawData;
-                List<(string, PLYFileReader.ElementType)> attributes;
-                PLYFileReader.ReadFile(filePath, out var splatCount, out var vertexStride, out attributes, out plyRawData);
+	            PLYFileReader.ReadFile(filePath, out var splatCount, out var vertexStride, out List<(string, PLYFileReader.ElementType)> attributes, out NativeArray<byte> plyRawData);
                 string attrError = CheckPLYAttributes(attributes);
                 if (!string.IsNullOrEmpty(attrError))
                     throw new IOException($"PLY file is probably not a Gaussian Splat file? Missing properties: {attrError}");
