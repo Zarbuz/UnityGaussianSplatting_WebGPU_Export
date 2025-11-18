@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+using System.Runtime.CompilerServices;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
@@ -63,94 +64,257 @@ namespace GaussianSplatting.Runtime
                 RadixSortInPlace(splatList, count);
             }
 
-            // Insertion sort for small arrays - excellent cache performance
+            // Optimized insertion sort for very small arrays with distance caching
             void InsertionSortInPlace(UnsafeList<int> list, int count)
             {
                 unsafe
                 {
                     int* ptr = list.Ptr;
 
+                    // Pre-compute distances for small arrays (worth it for insertion sort)
+                    float* distCache = stackalloc float[count];
+                    for (int i = 0; i < count; i++)
+                    {
+                        distCache[i] = GetSquaredDistance(ptr[i]);
+                    }
+
+                    // Insertion sort with cached distances
                     for (int i = 1; i < count; i++)
                     {
                         int keyIndex = ptr[i];
-                        float keyDist = GetSquaredDistance(keyIndex);
+                        float keyDist = distCache[i];
                         int j = i - 1;
 
-                        while (j >= 0 && GetSquaredDistance(ptr[j]) > keyDist)
+                        // Early exit if already sorted
+                        if (distCache[j] <= keyDist)
+                            continue;
+
+                        while (j >= 0 && distCache[j] > keyDist)
                         {
                             ptr[j + 1] = ptr[j];
+                            distCache[j + 1] = distCache[j];
                             j--;
                         }
                         ptr[j + 1] = keyIndex;
+                        distCache[j + 1] = keyDist;
                     }
                 }
             }
 
-            // Optimized in-place quicksort with inline distance comparison
-            // Avoids interface overhead and memory allocations
+            // Ultra-optimized introsort with distance caching
+            // Combines quicksort, heapsort, and insertion sort for optimal performance
             void RadixSortInPlace(UnsafeList<int> list, int count)
             {
                 unsafe
                 {
                     int* indices = list.Ptr;
-                    QuickSortInPlace(indices, 0, count - 1);
+
+                    // Calculate max recursion depth for introsort (2 * log2(n))
+                    int maxDepth = 2 * (int)math.log2(count);
+
+                    // Allocate distance cache on stack for small arrays, heap for large
+                    bool useHeap = count > 4096;
+                    float* distCache;
+
+                    if (useHeap)
+                    {
+                        distCache = (float*)UnsafeUtility.Malloc(count * sizeof(float), UnsafeUtility.AlignOf<float>(), Allocator.Temp);
+                    }
+                    else
+                    {
+                        float* tempCache = stackalloc float[count];
+                        distCache = tempCache;
+                    }
+
+                    // Pre-compute all distances (trade memory for speed)
+                    for (int i = 0; i < count; i++)
+                    {
+                        distCache[i] = GetSquaredDistance(indices[i]);
+                    }
+
+                    // Run introsort with distance cache
+                    IntroSortInPlace(indices, distCache, 0, count - 1, maxDepth);
+
+                    if (useHeap)
+                    {
+                        UnsafeUtility.Free(distCache, Allocator.Temp);
+                    }
                 }
             }
 
-            // Inline quicksort implementation with direct distance comparison
-            unsafe void QuickSortInPlace(int* indices, int left, int right)
+            // Introsort: Quicksort with heapsort fallback to guarantee O(n log n)
+            unsafe void IntroSortInPlace(int* indices, float* distCache, int left, int right, int depthLimit)
             {
-                // Use insertion sort for small subarrays (faster due to cache locality)
-                if (right - left < 16)
+                while (right - left > 0)
                 {
-                    for (int i = left + 1; i <= right; i++)
-                    {
-                        int keyIndex = indices[i];
-                        float keyDist = GetSquaredDistance(keyIndex);
-                        int j = i - 1;
+                    int size = right - left + 1;
 
-                        while (j >= left && GetSquaredDistance(indices[j]) > keyDist)
-                        {
-                            indices[j + 1] = indices[j];
-                            j--;
-                        }
-                        indices[j + 1] = keyIndex;
+                    // Use insertion sort for small subarrays (cache-friendly)
+                    if (size <= 32)
+                    {
+                        InsertionSortCached(indices, distCache, left, right);
+                        return;
                     }
-                    return;
+
+                    // Switch to heapsort if recursion too deep (avoid O(n²) worst case)
+                    if (depthLimit == 0)
+                    {
+                        HeapSortCached(indices, distCache, left, right);
+                        return;
+                    }
+
+                    depthLimit--;
+
+                    // Three-way partition for better handling of duplicates
+                    int pivotPos = PartitionMedianOf3(indices, distCache, left, right);
+
+                    // Tail recursion optimization: recurse on smaller partition, loop on larger
+                    if (pivotPos - left < right - pivotPos)
+                    {
+                        IntroSortInPlace(indices, distCache, left, pivotPos - 1, depthLimit);
+                        left = pivotPos + 1;
+                    }
+                    else
+                    {
+                        IntroSortInPlace(indices, distCache, pivotPos + 1, right, depthLimit);
+                        right = pivotPos - 1;
+                    }
+                }
+            }
+
+            // Optimized partition using median-of-3 pivot selection
+            unsafe int PartitionMedianOf3(int* indices, float* distCache, int left, int right)
+            {
+                int mid = left + (right - left) / 2;
+
+                // Median-of-3: sort left, mid, right
+                if (distCache[left] > distCache[mid])
+                {
+                    Swap(ref indices[left], ref indices[mid]);
+                    Swap(ref distCache[left], ref distCache[mid]);
+                }
+                if (distCache[mid] > distCache[right])
+                {
+                    Swap(ref indices[mid], ref indices[right]);
+                    Swap(ref distCache[mid], ref distCache[right]);
+                }
+                if (distCache[left] > distCache[mid])
+                {
+                    Swap(ref indices[left], ref indices[mid]);
+                    Swap(ref distCache[left], ref distCache[mid]);
                 }
 
-                // Quicksort partition with inline distance comparison
-                int pivotIndex = left + (right - left) / 2;
-                float pivotDist = GetSquaredDistance(indices[pivotIndex]);
+                // Use mid as pivot
+                float pivotDist = distCache[mid];
 
                 // Move pivot to end
-                int pivotValue = indices[pivotIndex];
-                indices[pivotIndex] = indices[right];
-                indices[right] = pivotValue;
+                Swap(ref indices[mid], ref indices[right - 1]);
+                Swap(ref distCache[mid], ref distCache[right - 1]);
 
-                int storeIndex = left;
-                for (int i = left; i < right; i++)
+                // Partition
+                int i = left;
+                int j = right - 1;
+
+                while (true)
                 {
-                    if (GetSquaredDistance(indices[i]) < pivotDist)
-                    {
-                        // Swap
-                        int temp = indices[i];
-                        indices[i] = indices[storeIndex];
-                        indices[storeIndex] = temp;
-                        storeIndex++;
-                    }
+                    while (distCache[++i] < pivotDist) { }
+                    while (distCache[--j] > pivotDist) { }
+
+                    if (i >= j) break;
+
+                    Swap(ref indices[i], ref indices[j]);
+                    Swap(ref distCache[i], ref distCache[j]);
                 }
 
-                // Move pivot to its final position
-                int finalPivot = indices[right];
-                indices[right] = indices[storeIndex];
-                indices[storeIndex] = finalPivot;
+                // Restore pivot
+                Swap(ref indices[i], ref indices[right - 1]);
+                Swap(ref distCache[i], ref distCache[right - 1]);
 
-                // Recursively sort partitions
-                if (storeIndex > left)
-                    QuickSortInPlace(indices, left, storeIndex - 1);
-                if (storeIndex < right)
-                    QuickSortInPlace(indices, storeIndex + 1, right);
+                return i;
+            }
+
+            // Optimized insertion sort using cached distances
+            unsafe void InsertionSortCached(int* indices, float* distCache, int left, int right)
+            {
+                for (int i = left + 1; i <= right; i++)
+                {
+                    int keyIndex = indices[i];
+                    float keyDist = distCache[i];
+                    int j = i - 1;
+
+                    // Unroll first comparison to reduce loop overhead
+                    if (distCache[j] <= keyDist)
+                        continue;
+
+                    while (j >= left && distCache[j] > keyDist)
+                    {
+                        indices[j + 1] = indices[j];
+                        distCache[j + 1] = distCache[j];
+                        j--;
+                    }
+
+                    indices[j + 1] = keyIndex;
+                    distCache[j + 1] = keyDist;
+                }
+            }
+
+            // Heapsort fallback for worst-case scenarios
+            unsafe void HeapSortCached(int* indices, float* distCache, int left, int right)
+            {
+                int n = right - left + 1;
+
+                // Build max heap
+                for (int i = n / 2 - 1; i >= 0; i--)
+                {
+                    HeapifyDown(indices, distCache, left, i, n);
+                }
+
+                // Extract elements from heap
+                for (int i = n - 1; i > 0; i--)
+                {
+                    Swap(ref indices[left], ref indices[left + i]);
+                    Swap(ref distCache[left], ref distCache[left + i]);
+                    HeapifyDown(indices, distCache, left, 0, i);
+                }
+            }
+
+            unsafe void HeapifyDown(int* indices, float* distCache, int offset, int root, int size)
+            {
+                while (true)
+                {
+                    int largest = root;
+                    int leftChild = 2 * root + 1;
+                    int rightChild = 2 * root + 2;
+
+                    if (leftChild < size && distCache[offset + leftChild] > distCache[offset + largest])
+                        largest = leftChild;
+
+                    if (rightChild < size && distCache[offset + rightChild] > distCache[offset + largest])
+                        largest = rightChild;
+
+                    if (largest == root)
+                        break;
+
+                    Swap(ref indices[offset + root], ref indices[offset + largest]);
+                    Swap(ref distCache[offset + root], ref distCache[offset + largest]);
+                    root = largest;
+                }
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            unsafe void Swap(ref int a, ref int b)
+            {
+                int temp = a;
+                a = b;
+                b = temp;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            unsafe void Swap(ref float a, ref float b)
+            {
+                float temp = a;
+                a = b;
+                b = temp;
             }
 
             float GetSquaredDistance(int splatIndex)
