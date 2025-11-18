@@ -209,12 +209,29 @@ namespace GaussianSplatting.Runtime
         }
 
         /// <summary>
-        /// Build octree from splat position data and bounds.
+        /// Build octree from splat position data and bounds (synchronous version).
+        /// For legacy compatibility. Consider using BuildAsync for better memory management.
+        /// NOTE: Octree takes ownership of the splatPositions array - caller should not dispose it.
         /// </summary>
         public void Build(NativeArray<float3> splatPositions, Bounds sceneBounds, float splatPercent)
         {
+            // Run the async version synchronously
+            var task = BuildAsync(splatPositions, sceneBounds, splatPercent);
+            task.Wait();
+        }
+
+        /// <summary>
+        /// Build octree asynchronously from splat position data and bounds.
+        /// Optimized with Burst-compiled jobs and incremental memory cleanup to reduce peak memory usage.
+        /// Critical for WebGL builds where WASM heap size is limited.
+        /// NOTE: Octree takes ownership of the splatPositions array - caller should not dispose it.
+        /// </summary>
+        /// <param name="splatPositions">Splat position data (must be Allocator.Persistent, octree takes ownership)</param>
+        /// <param name="sceneBounds">Scene bounds</param>
+        /// <param name="splatPercent">Percentage of splats to include in octree</param>
+        public async Task BuildAsync(NativeArray<float3> splatPositions, Bounds sceneBounds, float splatPercent)
+        {
             Clear();
-            // m_OthersNodeIndex removed - use m_OthersIndices list instead
 
             if (splatPositions.Length == 0)
             {
@@ -224,85 +241,170 @@ namespace GaussianSplatting.Runtime
 
             Debug.Log($"Building octree with {splatPositions.Length} splats, bounds: {sceneBounds}");
 
-            // Compute center of mass and identify 95% closest splats
             int total = splatPositions.Length;
             m_TotalSplats = total;
-            float3 com = float3.zero;
-            for (int i = 0; i < total; i++)
-                com += splatPositions[i];
-            com /= total;
 
-            var distList = new List<(int idx, float d)>(total);
-            for (int i = 0; i < total; i++)
+            if (!splatPositions.IsCreated)
             {
-                float distance = math.distance(splatPositions[i], com);
-                distList.Add((i, distance));
+                Debug.LogError("Input splatPositions array is not created");
+                return;
             }
-            distList.Sort((a, b) => a.d.CompareTo(b.d));
 
-            // Reorder m_SplatInfos so that the closest part are first, others last
+            // ============================================================================
+            // PHASE 1: Parallel center of mass calculation using Burst
+            // ============================================================================
+            NativeArray<float3> comResult = default;
+            float3 com;
+
+            try
+            {
+                comResult = new NativeArray<float3>(1, Allocator.TempJob);
+                var comJob = new GaussianSplatBurstSorting.ComputeCenterOfMassJob
+                {
+                    positions = splatPositions, // Use input directly (read-only)
+                    result = comResult
+                };
+                var comHandle = comJob.Schedule();
+
+                // Wait async for COM job
+                while (!comHandle.IsCompleted)
+                    await Task.Yield();
+
+                comHandle.Complete();
+                com = comResult[0];
+            }
+            finally
+            {
+                // Clean up Phase 1 allocations immediately
+                if (comResult.IsCreated) comResult.Dispose();
+            }
+
+            // ============================================================================
+            // PHASE 2: Parallel distance calculation using Burst
+            // ============================================================================
+            NativeArray<float> distances = default;
+
+            try
+            {
+                distances = new NativeArray<float>(total, Allocator.TempJob);
+                var distJob = new GaussianSplatBurstSorting.ComputeDistancesJob
+                {
+                    positions = splatPositions, // Use input directly (read-only)
+                    centerOfMass = com,
+                    distances = distances
+                };
+                var distHandle = distJob.Schedule(total, 512);
+
+                // Wait async for distance job
+                while (!distHandle.IsCompleted)
+                    await Task.Yield();
+
+                distHandle.Complete();
+            }
+            finally
+            {
+                // Nothing to dispose - using caller's persistent buffer
+            }
+
+            // ============================================================================
+            // PHASE 3: Sort indices by distance using Burst
+            // ============================================================================
+            NativeArray<int> sortedIndices = default;
+
+            try
+            {
+                sortedIndices = new NativeArray<int>(total, Allocator.TempJob);
+                var sortJob = new GaussianSplatBurstSorting.SortIndicesByDistanceJob
+                {
+                    distances = distances,
+                    sortedIndices = sortedIndices
+                };
+                var sortHandle = sortJob.Schedule();
+
+                // Wait async for sort job
+                while (!sortHandle.IsCompleted)
+                    await Task.Yield();
+
+                sortHandle.Complete();
+            }
+            finally
+            {
+                // Clean up distances array after sorting
+                if (distances.IsCreated) distances.Dispose();
+            }
+
+            // ============================================================================
+            // PHASE 4: Partition into in-bounds and outliers
+            // ============================================================================
             int inCount = Mathf.CeilToInt(total * splatPercent);
             inCount = Mathf.Clamp(inCount, 1, total);
             int othersCount = total - inCount;
 
-            // Local build-time splat info list
-            var splatInfos = new List<SplatInfo>(total);
-            for (int i = 0; i < total; i++)
-            {
-                int src = distList[i].idx;
-                splatInfos.Add(new SplatInfo { position = splatPositions[src], originalIndex = src });
-            }
-
-            // Create / update global native positions buffer
+            // ============================================================================
+            // PHASE 5: Take ownership of positions buffer (no copy needed!)
+            // ============================================================================
             if (m_AllPositionsNativeValid)
             {
                 if (m_AllPositionsNative.IsCreated) m_AllPositionsNative.Dispose();
                 m_AllPositionsNativeValid = false;
             }
-            try
-            {
-                m_AllPositionsNative = new NativeArray<float3>(total, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                for (int i = 0; i < splatInfos.Count; i++)
-                {
-                    var si = splatInfos[i];
-                    int orig = si.originalIndex;
-                    if ((uint)orig < (uint)total)
-                        m_AllPositionsNative[orig] = si.position;
-                }
-                m_AllPositionsNativeValid = true;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"Failed to allocate global native positions buffer: {ex.Message}");
-                if (m_AllPositionsNative.IsCreated) m_AllPositionsNative.Dispose();
-                m_AllPositionsNativeValid = false;
-            }
 
-            // Create root bounds based on the inCount splats (centered on center-of-mass)
+            // Take ownership of the input array - saves memory by avoiding a copy!
+            m_AllPositionsNative = splatPositions;
+            m_AllPositionsNativeValid = true;
+
+            // Yield to allow GC to run
+            await Task.Yield();
+
+            // ============================================================================
+            // PHASE 6: Compute root bounds for in-bounds splats
+            // Use m_AllPositionsNative since splatPositions may be deallocated after yield
+            // ============================================================================
             Bounds rootBounds;
-            if (inCount > 0)
+            if (inCount > 0 && m_AllPositionsNativeValid)
             {
-                float3 min = splatInfos[0].position;
-                float3 max = splatInfos[0].position;
-                for (int i = 1; i < inCount; i++)
+                NativeArray<float3> minResult = default;
+                NativeArray<float3> maxResult = default;
+
+                try
                 {
-                    min = math.min(min, splatInfos[i].position);
-                    max = math.max(max, splatInfos[i].position);
+                    minResult = new NativeArray<float3>(1, Allocator.TempJob);
+                    maxResult = new NativeArray<float3>(1, Allocator.TempJob);
+
+                    var boundsJob = new GaussianSplatBurstSorting.ComputeBoundsJob
+                    {
+                        positions = m_AllPositionsNative, // Use persistent buffer
+                        indices = sortedIndices,
+                        startIndex = 0,
+                        count = inCount,
+                        minResult = minResult,
+                        maxResult = maxResult
+                    };
+                    boundsJob.Run();
+
+                    float3 min = minResult[0];
+                    float3 max = maxResult[0];
+                    rootBounds = new Bounds((max + min) * 0.5f, max - min);
                 }
-                rootBounds = new Bounds((max + min) * 0.5f, max - min);
+                finally
+                {
+                    if (minResult.IsCreated) minResult.Dispose();
+                    if (maxResult.IsCreated) maxResult.Dispose();
+                }
             }
             else
             {
-                // Fallback to provided scene bounds
                 rootBounds = sceneBounds;
             }
 
             m_RootBounds = rootBounds;
 
-            // Build tree recursively using only the in-root splats
+            // ============================================================================
+            // PHASE 7: Build octree recursively using sorted indices
+            // Use m_AllPositionsNative since splatPositions may be deallocated after yield
+            // ============================================================================
             m_Nodes.Clear();
 
-            // Create root node covering the in-root splats
             var rootNode = new OctreeNode
             {
                 bounds = m_RootBounds,
@@ -314,14 +416,27 @@ namespace GaussianSplatting.Runtime
             };
             m_Nodes.Add(rootNode);
 
-            // Build recursively starting from root (only for the in-root partition)
+            // Build recursively using sorted indices and persistent positions buffer
             var rootSplatList = new NativeList<int>(inCount, Allocator.Temp);
-            for (int i = 0; i < inCount; i++) rootSplatList.Add(i); // indices into splatInfos
-            BuildRecursive(0, 0, rootSplatList, splatInfos);
-            rootSplatList.Dispose();
+            try
+            {
+                for (int i = 0; i < inCount; i++)
+                {
+                    rootSplatList.Add(sortedIndices[i]);
+                }
+                BuildRecursiveOptimized(0, 0, rootSplatList, m_AllPositionsNative);
+            }
+            finally
+            {
+                rootSplatList.Dispose();
+            }
 
-            // Handle remaining outliers: put their original indices into m_SplatIndices and track them in m_OthersIndices
-            // Ensure m_OthersIndices is created before clearing
+            // Yield after tree build
+            await Task.Yield();
+
+            // ============================================================================
+            // PHASE 8: Handle outliers
+            // ============================================================================
             if (!m_OthersIndicesValid || !m_OthersIndices.IsCreated)
             {
                 if (m_OthersIndicesValid && m_OthersIndices.IsCreated)
@@ -338,13 +453,15 @@ namespace GaussianSplatting.Runtime
             {
                 for (int i = 0; i < othersCount; i++)
                 {
-                    int orig = splatInfos[inCount + i].originalIndex;
-                    m_OthersIndices.Add(orig);
+                    int originalIdx = sortedIndices[inCount + i];
+                    m_OthersIndices.Add(originalIdx);
                 }
             }
-            m_OthersSorted = false; // reset outlier sorting state after build
+
+            m_OthersSorted = false;
             m_LastOthersSortCamPos = Vector3.zero;
-            // Compute average outlier ring radius (ignore min/max & extra stats for simplicity)
+
+            // Compute average outlier ring radius
             m_OutlierRingRadius = 0f;
             if (othersCount > 0 && m_AllPositionsNativeValid)
             {
@@ -352,7 +469,7 @@ namespace GaussianSplatting.Runtime
                 double accum = 0.0;
                 for (int i = 0; i < othersCount; i++)
                 {
-                    int orig = splatInfos[inCount + i].originalIndex;
+                    int orig = sortedIndices[inCount + i];
                     if (orig >= 0 && orig < m_AllPositionsNative.Length)
                     {
                         float3 p = m_AllPositionsNative[orig];
@@ -362,13 +479,18 @@ namespace GaussianSplatting.Runtime
                 m_OutlierRingRadius = (float)(accum / othersCount);
             }
 
-            // Tighten bounding boxes starting from leaves and propagating up
+            // Clean up sortedIndices (last remaining temp allocation)
+            if (sortedIndices.IsCreated) sortedIndices.Dispose();
+
+            // Yield before final operations
+            await Task.Yield();
+
+            // Tighten bounding boxes
             TightenBounds();
 
             m_Built = true;
 
-            // Ensure a GPU buffer exists even if there are no visible splats yet.
-            // Allocate a minimal 1-entry structured buffer so renderer code can safely bind/check it.
+            // Ensure GPU buffer exists
             if (m_VisibleIndicesBuffer == null)
             {
                 m_VisibleIndicesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint))
@@ -387,7 +509,11 @@ namespace GaussianSplatting.Runtime
             EnsureVisibleSplatIndicesCapacity(m_TotalSplats);
         }
 
-        void BuildRecursive(int nodeIndex, int depth, NativeList<int> splatList, List<SplatInfo> splatInfos)
+        /// <summary>
+        /// Optimized recursive build that works directly with position data.
+        /// No intermediate SplatInfo list needed - reduced memory usage.
+        /// </summary>
+        void BuildRecursiveOptimized(int nodeIndex, int depth, NativeList<int> splatList, NativeArray<float3> positions)
         {
             var node = m_Nodes[nodeIndex];
 
@@ -399,13 +525,11 @@ namespace GaussianSplatting.Runtime
                 node.splatIndices.Clear();
                 for (int i = 0; i < splatList.Length; i++)
                 {
-                    int infoIdx = splatList[i];
-                    if (infoIdx < 0 || infoIdx >= splatInfos.Count)
+                    int splatIdx = splatList[i];
+                    if ((uint)splatIdx < (uint)positions.Length)
                     {
-                        Debug.LogError($"Octree leaf node splat info index out of bounds: {infoIdx} >= {splatInfos.Count}");
-                        continue;
+                        node.splatIndices.Add(splatIdx);
                     }
-                    node.splatIndices.Add(splatInfos[infoIdx].originalIndex);
                 }
 
                 m_Nodes[nodeIndex] = node;
@@ -437,24 +561,21 @@ namespace GaussianSplatting.Runtime
             for (int i = 0; i < 8; i++)
                 childSplatsIdx[i] = new NativeList<int>(Allocator.Temp);
 
-            // Assign splats (using splatList which holds indices into splatInfos) to child nodes
+            // Assign splats to child nodes based on position
             for (int ii = 0; ii < splatList.Length; ii++)
             {
-                int infoIdx = splatList[ii];
-                if (infoIdx < 0 || infoIdx >= splatInfos.Count)
-                {
-                    Debug.LogError($"Octree splat distribution info index out of bounds: {infoIdx} >= {splatInfos.Count}");
+                int splatIdx = splatList[ii];
+                if ((uint)splatIdx >= (uint)positions.Length)
                     continue;
-                }
 
-                var splat = splatInfos[infoIdx];
+                float3 pos = positions[splatIdx];
 
                 int childIndex = 0;
-                if (splat.position.x > center.x) childIndex |= 1;
-                if (splat.position.y > center.y) childIndex |= 2;
-                if (splat.position.z > center.z) childIndex |= 4;
+                if (pos.x > center.x) childIndex |= 1;
+                if (pos.y > center.y) childIndex |= 2;
+                if (pos.z > center.z) childIndex |= 4;
 
-                childSplatsIdx[childIndex].Add(infoIdx);
+                childSplatsIdx[childIndex].Add(splatIdx);
             }
 
             // Create child nodes
@@ -481,7 +602,7 @@ namespace GaussianSplatting.Runtime
                 // Recursively build child only if it has splats
                 if (childSplatsIdx[i].Length > 0)
                 {
-                    BuildRecursive(childNodeIndex, depth + 1, childSplatsIdx[i], splatInfos);
+                    BuildRecursiveOptimized(childNodeIndex, depth + 1, childSplatsIdx[i], positions);
                 }
 
                 // Dispose temp child list

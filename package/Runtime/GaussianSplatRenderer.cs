@@ -2,8 +2,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Jobs;
 using Unity.Mathematics;
 using Unity.Profiling;
 using Unity.Profiling.LowLevel;
@@ -300,6 +302,11 @@ namespace GaussianSplatting.Runtime
             foreach (var kvp in m_ActiveSplats)
             {
                 var gs = kvp.Item1;
+
+                // Skip rendering if resources are still loading asynchronously
+                if (!gs.m_ResourcesReady)
+                    continue;
+
                 ++gs.m_FrameCounter;
                 var matrix = gs.transform.localToWorldMatrix;
 
@@ -530,6 +537,10 @@ namespace GaussianSplatting.Runtime
         int m_LastCullingFrame = -1;
         internal bool m_OctreeBuilt;
 
+        // Async loading state - prevents rendering until resources are fully loaded
+        internal bool m_ResourcesLoading;
+        internal bool m_ResourcesReady;
+
         internal static class Props
         {
             public static readonly int SrcBlend = Shader.PropertyToID("_SrcBlend");
@@ -591,44 +602,117 @@ namespace GaussianSplatting.Runtime
             m_Asset.colorData != null;
         public bool HasValidRenderSetup => m_GpuPosData != null && m_GpuOtherData != null && m_GpuChunks != null;
 
+        /// <summary>
+        /// Returns true if resources are currently being loaded asynchronously.
+        /// </summary>
+        public bool IsLoading => m_ResourcesLoading;
+
+        /// <summary>
+        /// Returns true if all resources (GPU buffers, octree) are fully loaded and ready for rendering.
+        /// </summary>
+        public bool IsReady => m_ResourcesReady;
+
         void CreateResourcesForAsset()
         {
-            if (!HasValidAsset)
-                return;
+            // Mark as loading and not ready for rendering
+            m_ResourcesLoading = true;
+            m_ResourcesReady = false;
 
-            m_SplatCount = asset.splatCount;
-            // For WebGL compatibility, use Vertex target instead of Raw
-            m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int) (asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
-            m_GpuPosData.SetData(asset.posData.GetData<uint>());
-            m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int) (asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
-            m_GpuOtherData.SetData(asset.otherData.GetData<uint>());
-            m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int) (asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
-            m_GpuSHData.SetData(asset.shData.GetData<uint>());
-            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
-            var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
-            // For WebGL compatibility, use simpler texture creation flags
-            var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.None) { name = "GaussianColorData" };
-            tex.SetPixelData(asset.colorData.GetData<byte>(), 0);
-            tex.Apply(false, true);
-            m_GpuColorData = tex;
+            // Fire-and-forget async version for memory efficiency
+            _ = CreateResourcesForAssetAsync();
+        }
+
+        async Task CreateResourcesForAssetAsync()
+        {
+            try
+            {
+                if (!HasValidAsset)
+                {
+                    m_ResourcesLoading = false;
+                    m_ResourcesReady = false;
+                    return;
+                }
+
+                m_SplatCount = asset.splatCount;
+
+            // Upload data to GPU buffers one at a time to reduce peak memory usage
+            // Each GetData() creates a temporary managed array copy that needs to be GC'd
+            // Yield between uploads to allow GC to reclaim memory
+
+            // PosData - dispose temp array immediately, then yield
+            {
+                m_GpuPosData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.posData.dataSize / 4), 4) { name = "GaussianPosData" };
+                var tempData = asset.posData.GetData<uint>();
+                m_GpuPosData.SetData(tempData);
+                tempData.Dispose();
+            }
+            await Task.Yield(); // Allow GC to run
+
+            // OtherData - dispose temp array immediately, then yield
+            {
+                m_GpuOtherData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.otherData.dataSize / 4), 4) { name = "GaussianOtherData" };
+                var tempData = asset.otherData.GetData<uint>();
+                m_GpuOtherData.SetData(tempData);
+                tempData.Dispose();
+            }
+            await Task.Yield(); // Allow GC to run
+
+            // SHData - dispose temp array immediately, then yield
+            {
+                m_GpuSHData = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, (int)(asset.shData.dataSize / 4), 4) { name = "GaussianSHData" };
+                var tempData = asset.shData.GetData<uint>();
+                m_GpuSHData.SetData(tempData);
+                tempData.Dispose();
+            }
+            await Task.Yield(); // Allow GC to run
+
+            // ColorData texture - dispose temp array immediately, then yield
+            {
+                var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(asset.splatCount);
+                var texFormat = GaussianSplatAsset.ColorFormatToGraphics(asset.colorFormat);
+                var tex = new Texture2D(texWidth, texHeight, texFormat, TextureCreationFlags.None) { name = "GaussianColorData" };
+                var tempData = asset.colorData.GetData<byte>();
+                tex.SetPixelData(tempData, 0);
+                tex.Apply(false, true);
+                tempData.Dispose();
+                m_GpuColorData = tex;
+            }
+            await Task.Yield(); // Allow GC to run
+
+            // ChunkData - dispose temp array immediately
             if (asset.chunkData != null && asset.chunkData.dataSize != 0)
             {
                 m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Vertex,
-                    (int) (asset.chunkData.dataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
-                m_GpuChunks.SetData(asset.chunkData.GetData<GaussianSplatAsset.ChunkInfo>());
+                    (int)(asset.chunkData.dataSize / UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()),
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
+                var tempData = asset.chunkData.GetData<GaussianSplatAsset.ChunkInfo>();
+                m_GpuChunks.SetData(tempData);
+                tempData.Dispose();
                 m_GpuChunksValid = true;
             }
             else
             {
-                // just a dummy chunk buffer
                 m_GpuChunks = new GraphicsBuffer(GraphicsBuffer.Target.Vertex, 1,
-                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) {name = "GaussianChunkData"};
+                    UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()) { name = "GaussianChunkData" };
                 m_GpuChunksValid = false;
             }
+            await Task.Yield(); // Allow GC to run before octree build
 
-            // Build octree for culling if enabled
-            BuildOctreeForCulling();
+                // Build octree for culling if enabled (async to reduce memory spikes)
+                await BuildOctreeForCullingAsync();
+
+                // Mark resources as fully loaded and ready for rendering
+                m_ResourcesLoading = false;
+                m_ResourcesReady = true;
+
+                Debug.Log($"GaussianSplatRenderer: Resources fully loaded for {name}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Failed to load resources for {name}: {ex.Message}\n{ex.StackTrace}");
+                m_ResourcesLoading = false;
+                m_ResourcesReady = false;
+            }
         }
 
         bool resourcesAreSetUp => GaussianSplatSettings.instance.resourcesFound;
@@ -727,6 +811,10 @@ namespace GaussianSplatting.Runtime
 
             m_SplatCount = 0;
             m_GpuChunksValid = false;
+
+            // Reset loading state
+            m_ResourcesLoading = false;
+            m_ResourcesReady = false;
         }
 
         public void OnDisable()
@@ -837,7 +925,7 @@ namespace GaussianSplatting.Runtime
             }
         }
 
-        void BuildOctreeForCulling()
+        async Task BuildOctreeForCullingAsync()
         {
             var settings = GaussianSplatSettings.instance;
             if (!settings.m_EnableOctreeCulling)
@@ -846,12 +934,16 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
+            NativeArray<float3> splatPositions = default;
+            NativeArray<float3> worldSplatPositions = default;
+
             try
             {
                 Debug.Log($"Building octree for {name}: SplatCount={m_SplatCount}, Format={asset.posFormat}");
-                
+
                 // Extract splat positions from asset data
-                var splatPositions = ExtractSplatPositions();
+                // Use TempJob allocator for async operations (Temp gets deallocated across yields)
+                splatPositions = ExtractSplatPositions();
                 if (splatPositions.Length == 0)
                 {
                     Debug.LogWarning($"No splat positions extracted for {name}");
@@ -860,42 +952,58 @@ namespace GaussianSplatting.Runtime
                 }
 
                 // Calculate scene bounds (apply object transform to account for scale/rotation/translation)
-                NativeArray<float3> worldSplatPositions = new NativeArray<float3>(splatPositions.Length, Allocator.Temp);
-                try
-                {
-                    var tr = transform;
-                    for (int i = 0; i < splatPositions.Length; i++)
-                    {
-                        var p = splatPositions[i];
-                        var wp = tr.TransformPoint(new Vector3(p.x, p.y, p.z));
-                        worldSplatPositions[i] = new float3(wp.x, wp.y, wp.z);
-                    }
+                // Use Persistent allocator - we'll pass ownership to octree to avoid extra copy
+                worldSplatPositions = new NativeArray<float3>(splatPositions.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
-                    var bounds = CalculateSplatBounds(worldSplatPositions);
-                    Debug.Log($"Scene bounds for {name} (world-space): {bounds}");
-
-                    // Initialize and build octree using world-space positions
-                    m_Octree ??= new GaussianSplatOctree();
-                    m_Octree.Initialize(settings.m_OctreeMaxDepth, settings.m_OctreeMaxSplatsPerLeaf);
-                    m_Octree.Build(worldSplatPositions, bounds, settings.m_OctreeSplatRatio);
-                }
-                finally
+                // Use Burst parallel job for fast transformation (avoids freeze for large datasets)
+                var transformJob = new GaussianSplatBurstSorting.TransformPositionsJob
                 {
-                    splatPositions.Dispose();
-                    worldSplatPositions.Dispose();
-                }
+                    localPositions = splatPositions,
+                    worldPositions = worldSplatPositions,
+                    transformMatrix = transform.localToWorldMatrix
+                };
+                var transformHandle = transformJob.Schedule(splatPositions.Length, 1024); // Batch size 1024
+
+                // Wait async for transform job
+                while (!transformHandle.IsCompleted)
+                    await Task.Yield();
+
+                transformHandle.Complete();
+
+                // Dispose local positions immediately after transform to reduce memory
+                splatPositions.Dispose();
+                splatPositions = default;
+
+                var bounds = CalculateSplatBounds(worldSplatPositions);
+                Debug.Log($"Scene bounds for {name} (world-space): {bounds}");
+
+                // Initialize and build octree using world-space positions (async for memory efficiency)
+                m_Octree ??= new GaussianSplatOctree();
+                m_Octree.Initialize(settings.m_OctreeMaxDepth, settings.m_OctreeMaxSplatsPerLeaf);
+
+                // Pass worldSplatPositions to octree (octree takes ownership, don't dispose!)
+                await m_Octree.BuildAsync(worldSplatPositions, bounds, settings.m_OctreeSplatRatio);
+
+                // Mark as default since octree now owns it
+                worldSplatPositions = default;
 
                 m_OctreeBuilt = true;
 
                 // Log debug info
                 m_Octree.GetDebugInfo(out int leafNodes, out int maxDepth, out int maxSplatsInLeaf);
                 Debug.Log($"Gaussian Splat Octree built for {name}: {leafNodes} leaf nodes, max depth {maxDepth}, max splats per leaf {maxSplatsInLeaf}");
-                
+
             }
             catch (System.Exception e)
             {
                 Debug.LogError($"Failed to build octree for {name}: {e.Message}\nStack trace: {e.StackTrace}");
                 m_OctreeBuilt = false;
+            }
+            finally
+            {
+                // Dispose after async operation completes
+                if (splatPositions.IsCreated) splatPositions.Dispose();
+                if (worldSplatPositions.IsCreated) worldSplatPositions.Dispose();
             }
         }
 
@@ -911,159 +1019,62 @@ namespace GaussianSplatting.Runtime
                 return new NativeArray<float3>();
             }
 
-            var positions = new NativeArray<float3>(m_SplatCount, Allocator.Temp);
-            var posData = asset.posData.GetData<uint>();
-            var chunkData = asset.chunkData?.GetData<GaussianSplatAsset.ChunkInfo>();
-            
-            int vectorSize = GaussianSplatAsset.GetVectorSize(asset.posFormat);
-            
-            // Calculate expected data size and validate
-            long expectedDataSize = (long)m_SplatCount * vectorSize;
-            long actualDataSize = posData.Length * 4; // posData is uint[], so 4 bytes per element
-            
-            if (expectedDataSize > actualDataSize)
-            {
-                Debug.LogError($"Position data size mismatch: expected {expectedDataSize} bytes, got {actualDataSize} bytes. " +
-                             $"SplatCount={m_SplatCount}, VectorSize={vectorSize}, Format={asset.posFormat}");
-                positions.Dispose();
-                return new NativeArray<float3>();
-            }
-            
-            Debug.Log($"Extracting {m_SplatCount} splat positions. Format: {asset.posFormat}, VectorSize: {vectorSize}, " +
-                     $"PosData length: {posData.Length} uints ({posData.Length * 4} bytes)");
-            
-            for (int i = 0; i < m_SplatCount; i++)
-            {
-                positions[i] = DecodeSplatPosition(posData, chunkData, i, asset.posFormat, vectorSize);
-            }
-            
-            return positions;
-        }
+            // Use TempJob for async-safe allocation (caller is async)
+            var positions = new NativeArray<float3>(m_SplatCount, Allocator.TempJob);
 
-        float3 DecodeSplatPosition(NativeArray<uint> posData, NativeArray<GaussianSplatAsset.ChunkInfo>? chunkData, int splatIndex, GaussianSplatAsset.VectorFormat format, int vectorSize)
-        {
-            // Calculate byte address for this splat's position data
-            int byteAddr = splatIndex * vectorSize;
-            int uintAddr = byteAddr / 4;
-            
-            // Check bounds to prevent out-of-range errors
-            if (uintAddr >= posData.Length)
-            {
-                Debug.LogError($"Position data out of bounds: uintAddr={uintAddr}, posData.Length={posData.Length}, splatIndex={splatIndex}, vectorSize={vectorSize}");
-                return float3.zero;
-            }
-            
-            float3 position = float3.zero;
-            
-            switch (format)
-            {
-                case GaussianSplatAsset.VectorFormat.Float32:
-                    // 3 consecutive float32 values - need to check we have enough data
-                    if (uintAddr + 2 >= posData.Length)
-                    {
-                        Debug.LogError($"Float32 position data out of bounds: need {uintAddr + 2}, have {posData.Length}");
-                        return float3.zero;
-                    }
-                    position.x = math.asfloat(posData[uintAddr]);
-                    position.y = math.asfloat(posData[uintAddr + 1]);
-                    position.z = math.asfloat(posData[uintAddr + 2]);
-                    break;
-                    
-                case GaussianSplatAsset.VectorFormat.Norm16:
-                    // Packed 16.16.16 format (6 bytes total, needs special handling)
-                    if (uintAddr + 1 >= posData.Length)
-                    {
-                        Debug.LogError($"Norm16 position data out of bounds: need {uintAddr + 1}, have {posData.Length}");
-                        return float3.zero;
-                    }
-                    {
-                        uint val0 = posData[uintAddr];
-                        uint val1 = posData[uintAddr + 1];
-                        // Handle unaligned access
-                        if ((byteAddr & 3) != 0)
-                        {
-                            val0 = (val0 >> 16) | ((val1 & 0xFFFF) << 16);
-                            val1 >>= 16;
-                        }
-                        position.x = (val0 & 0xFFFF) / 65535.0f;
-                        position.y = ((val0 >> 16) & 0xFFFF) / 65535.0f;
-                        position.z = (val1 & 0xFFFF) / 65535.0f;
-                    }
-                    break;
-                    
-                case GaussianSplatAsset.VectorFormat.Norm11:
-                    // Packed 11.10.11 format (32 bits total)
-                    {
-                        uint val = posData[uintAddr];
-                        if ((byteAddr & 3) != 0)
-                        {
-                            if (uintAddr + 1 >= posData.Length)
-                            {
-                                Debug.LogError($"Norm11 position data out of bounds for unaligned access: need {uintAddr + 1}, have {posData.Length}");
-                                return float3.zero;
-                            }
-                            uint val1 = posData[uintAddr + 1];
-                            val = (val >> 16) | ((val1 & 0xFFFF) << 16);
-                        }
-                        position.x = (val & 2047) / 2047.0f;
-                        position.y = ((val >> 11) & 1023) / 1023.0f;
-                        position.z = ((val >> 21) & 2047) / 2047.0f;
-                    }
-                    break;
-                    
-                case GaussianSplatAsset.VectorFormat.Norm6:
-                    // Packed 6.5.5 format (16 bits total)
-                    {
+            // Get data temporarily - dispose as soon as we're done decoding
+            NativeArray<uint> posData = default;
+            NativeArray<GaussianSplatAsset.ChunkInfo> chunkData = default;
 
-                        uint val = LoadUShortFromByteAddr(posData, byteAddr);
-                        position.x = (val & 63) / 63.0f;
-                        position.y = ((val >> 6) & 31) / 31.0f;
-                        position.z = ((val >> 11) & 31) / 31.0f;
-                    }
-                    break;
-            }
-            
-            // Apply chunk-relative positioning if chunk data exists
-            if (chunkData.HasValue && chunkData.Value.IsCreated && chunkData.Value.Length > 0)
+            try
             {
-                int chunkIndex = splatIndex / GaussianSplatAsset.kChunkSize;
-                if (chunkIndex < chunkData.Value.Length)
+                posData = asset.posData.GetData<uint>();
+                chunkData = asset.chunkData?.GetData<GaussianSplatAsset.ChunkInfo>() ?? default;
+
+                int vectorSize = GaussianSplatAsset.GetVectorSize(asset.posFormat);
+
+                // Calculate expected data size and validate
+                long expectedDataSize = (long)m_SplatCount * vectorSize;
+                long actualDataSize = posData.Length * 4; // posData is uint[], so 4 bytes per element
+
+                if (expectedDataSize > actualDataSize)
                 {
-                    var chunk = chunkData.Value[chunkIndex];
-                    // Convert chunk bounds to world space
-                    position.x = math.lerp(chunk.posX.x, chunk.posX.y, position.x);
-                    position.y = math.lerp(chunk.posY.x, chunk.posY.y, position.y);
-                    position.z = math.lerp(chunk.posZ.x, chunk.posZ.y, position.z);
+                    Debug.LogError($"Position data size mismatch: expected {expectedDataSize} bytes, got {actualDataSize} bytes. " +
+                                 $"SplatCount={m_SplatCount}, VectorSize={vectorSize}, Format={asset.posFormat}");
+                    positions.Dispose();
+                    return new NativeArray<float3>();
                 }
-            }
-            else
-            {
-                // Use asset bounds
-                var boundsMin = asset.boundsMin;
-                var boundsMax = asset.boundsMax;
-                position.x = math.lerp(boundsMin.x, boundsMax.x, position.x);
-                position.y = math.lerp(boundsMin.y, boundsMax.y, position.y);
-                position.z = math.lerp(boundsMin.z, boundsMax.z, position.z);
-            }
-            
-            return position;
-        }
 
-        uint LoadUShortFromByteAddr(NativeArray<uint> data, int byteAddr)
-        {
-            int alignedAddr = byteAddr & ~0x3;
-            int uintIndex = alignedAddr / 4;
-            
-            if (uintIndex >= data.Length)
-            {
-                Debug.LogError($"LoadUShortFromByteAddr out of bounds: uintIndex={uintIndex}, data.Length={data.Length}, byteAddr={byteAddr}");
-                return 0;
+                Debug.Log($"Extracting {m_SplatCount} splat positions using Burst job. Format: {asset.posFormat}, VectorSize: {vectorSize}, " +
+                         $"PosData length: {posData.Length} uints ({posData.Length * 4} bytes)");
+
+                // Create and schedule Burst-compiled parallel job to extract positions
+                var job = new GaussianSplatBurstSorting.ExtractSplatPositionsJob
+                {
+                    posData = posData,
+                    chunkData = chunkData.IsCreated ? chunkData : new NativeArray<GaussianSplatAsset.ChunkInfo>(),
+                    positions = positions,
+                    posFormat = asset.posFormat,
+                    vectorSize = vectorSize,
+                    boundsMin = asset.boundsMin,
+                    boundsMax = asset.boundsMax,
+                    useChunkData = chunkData.IsCreated && chunkData.Length > 0
+                };
+
+                // Schedule parallel job with optimal batch size (1024 splats per batch)
+                var jobHandle = job.Schedule(m_SplatCount, 1024);
+
+                // Complete the job (this waits for all parallel workers to finish)
+                jobHandle.Complete();
             }
-            
-            uint val = data[uintIndex];
-            if (byteAddr != alignedAddr)
-                val >>= 16;
-            return val & 0xFFFF;
+            finally
+            {
+                // Dispose temporary data immediately after decoding to reduce memory pressure
+                if (posData.IsCreated) posData.Dispose();
+                if (chunkData.IsCreated) chunkData.Dispose();
+            }
+
+            return positions;
         }
 
         Bounds CalculateSplatBounds(NativeArray<float3> positions)
