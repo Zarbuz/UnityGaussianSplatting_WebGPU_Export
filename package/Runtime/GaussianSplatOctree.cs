@@ -286,7 +286,8 @@ namespace GaussianSplatting.Runtime
 
             try
             {
-                distances = new NativeArray<float>(total, Allocator.TempJob);
+                // Use Persistent allocator because distances is used after async yields in Phase 3
+                distances = new NativeArray<float>(total, Allocator.Persistent);
                 var distJob = new GaussianSplatBurstSorting.ComputeDistancesJob
                 {
                     positions = splatPositions, // Use input directly (read-only)
@@ -301,9 +302,11 @@ namespace GaussianSplatting.Runtime
 
                 distHandle.Complete();
             }
-            finally
+            catch
             {
-                // Nothing to dispose - using caller's persistent buffer
+                // Cleanup on error
+                if (distances.IsCreated) distances.Dispose();
+                throw;
             }
 
             // ============================================================================
@@ -313,7 +316,9 @@ namespace GaussianSplatting.Runtime
 
             try
             {
-                sortedIndices = new NativeArray<int>(total, Allocator.TempJob);
+                // Use Persistent allocator because sortedIndices is used throughout async recursive build
+                // TempJob would be invalidated after async yields
+                sortedIndices = new NativeArray<int>(total, Allocator.Persistent);
                 var sortJob = new GaussianSplatBurstSorting.SortIndicesByDistanceJob
                 {
                     distances = distances,
@@ -417,22 +422,8 @@ namespace GaussianSplatting.Runtime
             m_Nodes.Add(rootNode);
 
             // Build recursively using sorted indices and persistent positions buffer
-            var rootSplatList = new NativeList<int>(inCount, Allocator.Temp);
-            try
-            {
-                for (int i = 0; i < inCount; i++)
-                {
-                    rootSplatList.Add(sortedIndices[i]);
-                }
-                BuildRecursiveOptimized(0, 0, rootSplatList, m_AllPositionsNative);
-            }
-            finally
-            {
-                rootSplatList.Dispose();
-            }
-
-            // Yield after tree build
-            await Task.Yield();
+            // Use async version to allow yielding during build for better memory management
+            await BuildRecursiveOptimizedAsync(0, 0, sortedIndices, 0, inCount, m_AllPositionsNative);
 
             // ============================================================================
             // PHASE 8: Handle outliers
@@ -510,22 +501,23 @@ namespace GaussianSplatting.Runtime
         }
 
         /// <summary>
-        /// Optimized recursive build that works directly with position data.
-        /// No intermediate SplatInfo list needed - reduced memory usage.
+        /// Async recursive build that works directly with sorted index array slices.
+        /// Uses array slicing instead of copying to reduce memory allocations.
+        /// Yields periodically during deep recursion to allow GC to run.
         /// </summary>
-        void BuildRecursiveOptimized(int nodeIndex, int depth, NativeList<int> splatList, NativeArray<float3> positions)
+        async Task BuildRecursiveOptimizedAsync(int nodeIndex, int depth, NativeArray<int> sortedIndices, int startIdx, int count, NativeArray<float3> positions)
         {
             var node = m_Nodes[nodeIndex];
 
             // Check termination conditions
-            if (depth >= m_MaxDepth || splatList.Length <= m_MaxSplatsPerLeaf)
+            if (depth >= m_MaxDepth || count <= m_MaxSplatsPerLeaf)
             {
                 // Make this a leaf node and store original indices for this leaf
                 node.isLeaf = true;
                 node.splatIndices.Clear();
-                for (int i = 0; i < splatList.Length; i++)
+                for (int i = 0; i < count; i++)
                 {
-                    int splatIdx = splatList[i];
+                    int splatIdx = sortedIndices[startIdx + i];
                     if ((uint)splatIdx < (uint)positions.Length)
                     {
                         node.splatIndices.Add(splatIdx);
@@ -535,6 +527,10 @@ namespace GaussianSplatting.Runtime
                 m_Nodes[nodeIndex] = node;
                 return;
             }
+
+            // Yield every 3 levels to allow GC to run (reduces peak memory)
+            if (depth % 3 == 0 && depth > 0)
+                await Task.Yield();
 
             // Create 8 child nodes
             var center = node.bounds.center;
@@ -556,15 +552,16 @@ namespace GaussianSplatting.Runtime
                 childBounds[i] = new Bounds(center + offset, size);
             }
 
-            // Distribute splats to children using NativeList
+            // OPTIMIZATION: Use single pre-allocated buffer for child distribution
+            // This avoids creating 8 separate NativeList allocations per recursion level
             var childSplatsIdx = new NativeList<int>[8];
             for (int i = 0; i < 8; i++)
                 childSplatsIdx[i] = new NativeList<int>(Allocator.Temp);
 
             // Assign splats to child nodes based on position
-            for (int ii = 0; ii < splatList.Length; ii++)
+            for (int ii = 0; ii < count; ii++)
             {
-                int splatIdx = splatList[ii];
+                int splatIdx = sortedIndices[startIdx + ii];
                 if ((uint)splatIdx >= (uint)positions.Length)
                     continue;
 
@@ -578,16 +575,44 @@ namespace GaussianSplatting.Runtime
                 childSplatsIdx[childIndex].Add(splatIdx);
             }
 
-            // Create child nodes
+            // Create a temporary buffer to copy child indices into sortedIndices array
+            // This allows us to reuse sortedIndices for child recursion (in-place sorting)
+            int writePos = startIdx;
             for (int i = 0; i < 8; i++)
             {
+                for (int j = 0; j < childSplatsIdx[i].Length; j++)
+                {
+                    sortedIndices[writePos++] = childSplatsIdx[i][j];
+                }
+            }
+
+            // Create child nodes and recurse using array slices
+            int childStartIdx = startIdx;
+
+            // Store child counts before disposing the temp lists
+            var childCounts = new int[8];
+            for (int i = 0; i < 8; i++)
+            {
+                childCounts[i] = childSplatsIdx[i].Length;
+            }
+
+            // Dispose all temp lists BEFORE any await calls to prevent disposed object access
+            for (int i = 0; i < 8; i++)
+            {
+                childSplatsIdx[i].Dispose();
+            }
+
+            for (int i = 0; i < 8; i++)
+            {
+                int childCount = childCounts[i];
+
                 var childNode = new OctreeNode
                 {
                     bounds = childBounds[i],
                     center = childBounds[i].center,
                     splatIndices = new NativeList<int>(Allocator.Persistent),
                     childIndices = new NativeList<int>(8, Allocator.Persistent),
-                    isLeaf = childSplatsIdx[i].Length == 0,
+                    isLeaf = childCount == 0,
                     maxExtent = Mathf.Max(childBounds[i].extents.x, Mathf.Max(childBounds[i].extents.y, childBounds[i].extents.z))
                 };
 
@@ -599,14 +624,13 @@ namespace GaussianSplatting.Runtime
                 // Update parent reference in the global list (node is a reference type)
                 m_Nodes[nodeIndex] = node;
 
-                // Recursively build child only if it has splats
-                if (childSplatsIdx[i].Length > 0)
+                // Recursively build child only if it has splats (using array slice, no copy!)
+                if (childCount > 0)
                 {
-                    BuildRecursiveOptimized(childNodeIndex, depth + 1, childSplatsIdx[i], positions);
+                    await BuildRecursiveOptimizedAsync(childNodeIndex, depth + 1, sortedIndices, childStartIdx, childCount, positions);
                 }
 
-                // Dispose temp child list
-                childSplatsIdx[i].Dispose();
+                childStartIdx += childCount;
             }
         }
 
