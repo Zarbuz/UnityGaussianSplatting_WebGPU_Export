@@ -95,6 +95,9 @@ namespace GaussianSplatting.Runtime
         
         // Reusable stack for non-recursive octree traversal
         readonly Stack<int> m_TraversalStack = new();
+
+        // Reusable frustum planes array to avoid GC allocations
+        readonly Plane[] m_FrustumPlanes = new Plane[6];
         
         public int maxSortNodesPerFrame = 256; // In sequential path we do sort over time
         // Angular threshold for re-sorting: minimum cosine of angle change before re-sort is needed
@@ -841,8 +844,10 @@ namespace GaussianSplatting.Runtime
             {
                 m_VisibleNodeRefs.Clear();
             }
-            var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(camera);
-            CollectVisibleNodesWithDistance(0, frustumPlanes, camPosition);
+
+            // Calculate frustum planes into reusable array to avoid GC allocation
+            GeometryUtility.CalculateFrustumPlanes(camera, m_FrustumPlanes);
+            CollectVisibleNodesWithDistance(0, m_FrustumPlanes, camPosition);
 
             // Sort node references by distance (front-to-back)
             m_VisibleNodeRefs.AsArray().Sort(new VisibleNodeRefDistanceComparer());
