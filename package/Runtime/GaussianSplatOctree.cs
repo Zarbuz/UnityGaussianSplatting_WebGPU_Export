@@ -819,13 +819,14 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// Sort visible splat indices by 3D distance from camera (front-to-back for alpha blending).
         /// Hierarchical sorting optimization.
+        /// Fully async - uses previous frame's sorted data while current frame's sort runs in background.
         /// </summary>
         public void SortVisibleSplatsByDepth(Camera camera)
         {
             if (!m_Built)
                 return;
             var camPosition = camera.transform.position;
-            
+
             if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
             {
                 visibleSplatCount = 0;
@@ -852,21 +853,17 @@ namespace GaussianSplatting.Runtime
             // Sort node references by distance (front-to-back)
             m_VisibleNodeRefs.AsArray().Sort(new VisibleNodeRefDistanceComparer());
 
-            // Complete the PREVIOUS frame's sort job if one is running
-            // This gives the job maximum time to complete in the background
-            if (m_SortJobRunning)
-            {
-                CompleteSortJob(m_SortJobCameraPosition);
-            }
+            // ASYNC STRATEGY (fully non-blocking):
+            // Frame N:   Build indices from node data (sorted in frame N-1 or earlier)
+            //            Check if job from frame N-1 completed (non-blocking)
+            //            If completed: apply results to nodes (ready for frame N+1)
+            //            If no job running: schedule new sort job for current camera position
+            // Frame N+1: Will use the sorted data from frame N's job
+            //
+            // This creates 1-2 frame latency for sorting but NEVER blocks the main thread.
+            // The slight latency is acceptable since sorting is a rendering optimization.
 
-            // Schedule a NEW sort job for this frame (will be completed next frame)
-            // This creates a 1-frame latency but eliminates blocking
-            ScheduleBurstSortJobs(camPosition);
-
-            // NOTE: We DON'T complete the job here - it will run in the background
-            // and be completed on the next frame, giving it maximum time to execute
-
-            // Append nodes in distance order (their lists now internally sorted and persistent)
+            // Build visible splat indices from CURRENT node data
             int currentIndex = 0;
 
             // First, add node splats (front elements for front-to-back rendering)
@@ -916,9 +913,23 @@ namespace GaussianSplatting.Runtime
                 }
                 currentIndex += m_OthersIndices.Length;
             }
-            
+
             visibleSplatCount = currentIndex;
             UpdateVisibleIndicesBuffer();
+
+            // Complete previous job if it's ready (non-blocking check)
+            // This applies the sorted results to the node data
+            if (m_SortJobRunning && m_SortJobHandle.IsCompleted)
+            {
+                CompleteSortJob(m_SortJobCameraPosition);
+            }
+
+            // Only schedule a new job if no job is currently running
+            // This prevents overlapping jobs and resource conflicts
+            if (!m_SortJobRunning)
+            {
+                ScheduleBurstSortJobs(camPosition);
+            }
         }
 
         bool ShouldResortOutliers(Vector3 camPosition)
