@@ -117,7 +117,7 @@ namespace GaussianSplatting.Runtime
         bool m_SortJobRunning;
 
         // Storage for async job data (must persist until job completes)
-        NativeArray<int> m_FlattenedSplatIndices;
+        NativeArray<UnsafeList<int>> m_NodeSplatListPointers;
         NativeArray<GaussianSplatBurstSorting.NodeSortRange> m_NodeRanges;
         NativeList<int> m_NodesToSort;
         bool m_SortOutliers;
@@ -756,9 +756,9 @@ namespace GaussianSplatting.Runtime
             }
 
             // Dispose job data
-            if (m_FlattenedSplatIndices.IsCreated)
+            if (m_NodeSplatListPointers.IsCreated)
             {
-                try { m_FlattenedSplatIndices.Dispose(); } catch {}
+                try { m_NodeSplatListPointers.Dispose(); } catch {}
             }
             if (m_NodeRanges.IsCreated)
             {
@@ -952,7 +952,7 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// Schedule Burst-compiled parallel sorting jobs for all visible nodes and outliers.
         /// Uses IJobParallelFor for true parallel execution across CPU cores.
-        /// Sorts data in-place within NativeLists - zero GC allocation.
+        /// Sorts data in-place within NativeLists using optimized radix sort - zero GC allocation.
         /// </summary>
         void ScheduleBurstSortJobs(Vector3 camPosition)
         {
@@ -1000,71 +1000,58 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
-            // Calculate total size needed for flattened array
-            int totalSplatCount = 0;
-            for (int i = 0; i < m_NodesToSort.Length; i++)
-            {
-                int nodeIndex = m_NodesToSort[i];
-                var node = m_Nodes[nodeIndex];
-                totalSplatCount += node.splatIndices.Length;
-            }
-            if (m_SortOutliers)
-            {
-                totalSplatCount += m_OthersIndices.Length;
-            }
-
-            // Create flattened array and range metadata (persist until job completes)
-            m_FlattenedSplatIndices = new NativeArray<int>(totalSplatCount, Allocator.Persistent);
+            // Create arrays for in-place sorting
+            m_NodeSplatListPointers = new NativeArray<UnsafeList<int>>(totalJobCount, Allocator.Persistent);
             m_NodeRanges = new NativeArray<GaussianSplatBurstSorting.NodeSortRange>(totalJobCount, Allocator.Persistent);
 
-            // Flatten all node arrays into a single contiguous array
-            int currentOffset = 0;
+            // Setup node pointers and ranges for in-place sorting
             for (int i = 0; i < m_NodesToSort.Length; i++)
             {
                 int nodeIndex = m_NodesToSort[i];
-                var node = m_Nodes[nodeIndex];
-                int length = node.splatIndices.Length;
 
-                // Copy node's splat indices to flattened array
-                NativeArray<int>.Copy(node.splatIndices.AsArray(), 0, m_FlattenedSplatIndices, currentOffset, length);
+                // Get unsafe pointer to the node's NativeList directly from the list
+                unsafe
+                {
+                    var nodeRef = m_Nodes[nodeIndex];
+                    m_NodeSplatListPointers[i] = *nodeRef.splatIndices.GetUnsafeList();
+                }
 
                 // Store range metadata
                 m_NodeRanges[i] = new GaussianSplatBurstSorting.NodeSortRange
                 {
-                    offset = currentOffset,
-                    length = length
+                    nodeIndex = i,
+                    length = m_Nodes[nodeIndex].splatIndices.Length
                 };
-
-                currentOffset += length;
             }
 
             // Add outliers if needed
             if (m_SortOutliers)
             {
-                int length = m_OthersIndices.Length;
-                NativeArray<int>.Copy(m_OthersIndices.AsArray(), 0, m_FlattenedSplatIndices, currentOffset, length);
+                unsafe
+                {
+                    m_NodeSplatListPointers[m_NodesToSort.Length] = *m_OthersIndices.GetUnsafeList();
+                }
 
                 m_NodeRanges[m_NodesToSort.Length] = new GaussianSplatBurstSorting.NodeSortRange
                 {
-                    offset = currentOffset,
-                    length = length
+                    nodeIndex = m_NodesToSort.Length,
+                    length = m_OthersIndices.Length
                 };
             }
 
-            // Schedule the parallel job
-            var parallelSortJob = new GaussianSplatBurstSorting.SortMultipleNodesJob
+            // Schedule the parallel radix sort job
+            var parallelSortJob = new GaussianSplatBurstSorting.RadixSortMultipleNodesJob
             {
-                flattenedSplatIndices = m_FlattenedSplatIndices,
+                nodeSplatLists = m_NodeSplatListPointers,
                 nodeRanges = m_NodeRanges,
                 allPositions = m_AllPositionsNative,
                 cameraPosition = (float3)camPosition
             };
 
             // Calculate optimal batch size for better load balancing
-            // Smaller batches = better distribution across workers
-            // But too small = overhead from job scheduling
+            // Aim for 4x worker count to enable good work distribution
             int workerCount = Unity.Jobs.LowLevel.Unsafe.JobsUtility.JobWorkerCount;
-            int batchSize = Mathf.Max(1, totalJobCount / (workerCount * 4)); // 4x oversubscription for load balancing
+            int batchSize = Mathf.Max(1, totalJobCount / (workerCount * 4));
 
             // Schedule with parallel execution - DON'T complete yet
             m_SortJobHandle = parallelSortJob.Schedule(totalJobCount, batchSize);
@@ -1073,8 +1060,8 @@ namespace GaussianSplatting.Runtime
         }
 
         /// <summary>
-        /// Complete the pending sort job and copy sorted data back to nodes.
-        /// Should be called right before we need to use the sorted data.
+        /// Complete the pending sort job and mark nodes as sorted.
+        /// Data is already sorted in-place, so we just need to update metadata.
         /// </summary>
         void CompleteSortJob(Vector3 camPosition)
         {
@@ -1085,15 +1072,11 @@ namespace GaussianSplatting.Runtime
             m_SortJobHandle.Complete();
             m_SortJobRunning = false;
 
-            // Copy sorted data back to nodes
+            // Mark nodes as sorted (data is already sorted in-place)
             for (int i = 0; i < m_NodesToSort.Length; i++)
             {
                 int nodeIndex = m_NodesToSort[i];
                 var node = m_Nodes[nodeIndex];
-                var range = m_NodeRanges[i];
-
-                // Copy sorted data back
-                NativeArray<int>.Copy(m_FlattenedSplatIndices, range.offset, node.splatIndices.AsArray(), 0, range.length);
 
                 // Mark as sorted
                 node.isSorted = true;
@@ -1102,16 +1085,13 @@ namespace GaussianSplatting.Runtime
 
             if (m_SortOutliers)
             {
-                var range = m_NodeRanges[m_NodesToSort.Length];
-                NativeArray<int>.Copy(m_FlattenedSplatIndices, range.offset, m_OthersIndices.AsArray(), 0, range.length);
-
                 m_OthersSorted = true;
                 m_LastOthersSortCamPos = camPosition;
             }
 
             // Cleanup job data
-            if (m_FlattenedSplatIndices.IsCreated)
-                m_FlattenedSplatIndices.Dispose();
+            if (m_NodeSplatListPointers.IsCreated)
+                m_NodeSplatListPointers.Dispose();
             if (m_NodeRanges.IsCreated)
                 m_NodeRanges.Dispose();
             if (m_NodesToSort.IsCreated)
