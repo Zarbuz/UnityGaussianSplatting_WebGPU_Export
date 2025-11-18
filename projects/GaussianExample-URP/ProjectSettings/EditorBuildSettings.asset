@@ -5,8 +5,11 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
-  - enabled: 1
+  - enabled: 0
     path: Assets/GSTestScene.unity
     guid: 36934c1e75cb24745a91b0a1124a3179
+  - enabled: 1
+    path: Assets/DynamicLoad.unity
+    guid: 7cdd73c93e49dd8458c883a5e424cf12
   m_configObjects: {}
   m_UseUCBPForAssetBundles: 0

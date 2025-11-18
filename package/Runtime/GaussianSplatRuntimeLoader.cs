@@ -135,6 +135,7 @@ namespace GaussianSplatting.Runtime
 
         private bool OnProgress(string message, float progress)
         {
+			Debug.Log("[GaussianSplatRuntimeLoader] " + message + " " + progress);
             loadingStatus = message;
             loadingProgress = progress;
             return true; // Return false to cancel

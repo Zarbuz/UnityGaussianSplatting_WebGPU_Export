@@ -5,6 +5,7 @@ using GaussianSplatting.Runtime.Utils;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using GaussianSplatting.Editor.Utils;
 using Unity.Burst;
 using Unity.Collections;
 using UnityEditor;
@@ -240,7 +241,7 @@ namespace GaussianSplatting.Editor
 			return result;
 		}
 
-		void CreateAsset()
+		async void CreateAsset()
 		{
 			m_ErrorMessage = null;
 			if (string.IsNullOrWhiteSpace(m_InputFile))
@@ -281,7 +282,7 @@ namespace GaussianSplatting.Editor
 			}
 
 			var builder = new GaussianSplatAssetBuilder(buildSettings, ProgressCallback);
-			var buildResult = builder.BuildAsset(inputSplats);
+			var buildResult = await builder.BuildAsset(inputSplats);
 
 			string baseName = Path.GetFileNameWithoutExtension(FilePickerControl.PathToDisplayString(m_InputFile));
 

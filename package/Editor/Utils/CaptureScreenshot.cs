@@ -3,7 +3,7 @@
 using UnityEditor;
 using UnityEngine;
 
-namespace GaussianSplatting.Runtime.Utils
+namespace GaussianSplatting.Editor.Utils
 {
     public class CaptureScreenshot : MonoBehaviour
     {

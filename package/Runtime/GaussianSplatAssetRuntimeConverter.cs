@@ -17,6 +17,32 @@ namespace GaussianSplatting.Runtime
     public class GaussianSplatAssetRuntimeConverter
     {
         /// <summary>
+        /// Gets the recommended quality setting based on splat count for WebGL builds.
+        /// WebGL has memory constraints, so we need to use lower quality for large files.
+        /// </summary>
+        public static GaussianSplatAssetBuilder.DataQuality GetRecommendedQualityForWebGL(int splatCount)
+        {
+#if UNITY_WEBGL && !UNITY_EDITOR
+            // WebGL memory-optimized recommendations
+            if (splatCount < 100_000)
+                return GaussianSplatAssetBuilder.DataQuality.High;
+            else if (splatCount < 500_000)
+                return GaussianSplatAssetBuilder.DataQuality.Medium;
+            else if (splatCount < 1_000_000)
+                return GaussianSplatAssetBuilder.DataQuality.Low;
+            else
+                return GaussianSplatAssetBuilder.DataQuality.VeryLow;
+#else
+            // Desktop - can handle higher quality
+            if (splatCount < 500_000)
+                return GaussianSplatAssetBuilder.DataQuality.High;
+            else if (splatCount < 2_000_000)
+                return GaussianSplatAssetBuilder.DataQuality.Medium;
+            else
+                return GaussianSplatAssetBuilder.DataQuality.Low;
+#endif
+        }
+        /// <summary>
         /// Progress callback for reporting conversion progress.
         /// Parameters: (message, progress 0-1)
         /// Return false to cancel the operation.
@@ -49,8 +75,13 @@ namespace GaussianSplatting.Runtime
 
         /// <summary>
         /// Loads a PLY/SPZ file from a file path and converts it to a GaussianSplatAsset at runtime.
+        /// Supports absolute paths, relative paths, and StreamingAssets paths.
         /// </summary>
-        /// <param name="filePath">Path to the PLY/SPZ file</param>
+        /// <param name="filePath">Path to the PLY/SPZ file. Can be:
+        /// - Absolute path: "C:/MyFiles/splat.ply"
+        /// - Relative path: "Data/splat.ply"
+        /// - StreamingAssets path: "Assets/StreamingAssets/splat.ply" or "StreamingAssets/splat.ply"
+        /// </param>
         /// <param name="settings">Conversion settings (optional, uses default if null)</param>
         /// <returns>A GaussianSplatAsset ready to use at runtime</returns>
         public static async Task<GaussianSplatAsset> ConvertFromFileAsync(string filePath, ConversionSettings? settings = null)
@@ -61,12 +92,15 @@ namespace GaussianSplatting.Runtime
             {
                 conversionSettings.progressCallback?.Invoke("Loading file", 0.0f);
 
-                if (!File.Exists(filePath))
-                    throw new FileNotFoundException($"File not found: {filePath}");
+                // Resolve the file path (handles StreamingAssets, relative, and absolute paths)
+                string resolvedPath = ResolveFilePath(filePath);
+
+                if (!File.Exists(resolvedPath))
+                    throw new FileNotFoundException($"File not found: {resolvedPath} (original path: {filePath})");
 
                 // Read the input file
                 conversionSettings.progressCallback?.Invoke("Reading input file", 0.05f);
-                GaussianFileReader.ReadFile(filePath, out NativeArray<InputSplatData> inputSplats);
+                GaussianFileReader.ReadFile(resolvedPath, out NativeArray<InputSplatData> inputSplats);
 
                 if (!inputSplats.IsCreated || inputSplats.Length == 0)
                     throw new InvalidDataException("Failed to read splat data from file");
@@ -153,6 +187,9 @@ namespace GaussianSplatting.Runtime
             if (!inputSplats.IsCreated || inputSplats.Length == 0)
                 throw new ArgumentException("Input splats array is empty or not created");
 
+            // Build result to be disposed in finally block
+            GaussianSplatAssetBuilder.BuildResult buildResult = default;
+
             try
             {
                 // Wrap the progress callback to offset by 30% (file loading is 0-30%)
@@ -164,8 +201,8 @@ namespace GaussianSplatting.Runtime
                 // Use the builder to convert the data
                 var builder = new GaussianSplatAssetBuilder(conversionSettings.buildSettings, WrappedProgress);
 
-                // Run the build on a background thread to avoid blocking
-                var buildResult = await Task.Run(() => builder.BuildAsset(inputSplats));
+                // BuildAsset is now async with yields, so just await it directly
+                buildResult = await builder.BuildAsset(inputSplats);
 
                 WrappedProgress("Creating asset", 0.95f);
 
@@ -184,16 +221,30 @@ namespace GaussianSplatting.Runtime
                 asset.SetDataHash(buildResult.dataHash);
 
                 // Set the runtime data (convert NativeArray to byte[])
-                asset.SetRuntimeData(
-                    buildResult.chunkData.IsCreated ? buildResult.chunkData.ToArray() : null,
-                    buildResult.posData.ToArray(),
-                    buildResult.otherData.ToArray(),
-                    buildResult.colorData.ToArray(),
-                    buildResult.shData.ToArray()
-                );
+                // For WebGL, yield between conversions to allow GC
+                byte[] chunkData = buildResult.chunkData.IsCreated ? buildResult.chunkData.ToArray() : null;
+                await Task.Yield();
 
-                // Clean up build result
+                byte[] posData = buildResult.posData.ToArray();
+                await Task.Yield();
+
+                byte[] otherData = buildResult.otherData.ToArray();
+                await Task.Yield();
+
+                byte[] colorData = buildResult.colorData.ToArray();
+                await Task.Yield();
+
+                byte[] shData = buildResult.shData.ToArray();
+                await Task.Yield();
+
+                asset.SetRuntimeData(chunkData, posData, otherData, colorData, shData);
+
+                // Clean up build result BEFORE yielding to allow memory to be freed
                 buildResult.Dispose();
+                buildResult = default;
+
+                // Force a yield to allow GC to collect the disposed NativeArrays
+                await Task.Yield();
 
                 WrappedProgress("Conversion complete", 1.0f);
 
@@ -203,6 +254,12 @@ namespace GaussianSplatting.Runtime
             {
                 conversionSettings.progressCallback?.Invoke($"Error during conversion: {ex.Message}", 1.0f);
                 throw;
+            }
+            finally
+            {
+                // Ensure build result is disposed even if an error occurs
+                if (buildResult.posData.IsCreated)
+                    buildResult.Dispose();
             }
         }
 
@@ -229,6 +286,52 @@ namespace GaussianSplatting.Runtime
                 progressCallback?.Invoke(1.0f);
                 return request.downloadHandler.data;
             }
+        }
+
+        /// <summary>
+        /// Resolves a file path to an absolute path, handling StreamingAssets paths correctly.
+        /// </summary>
+        /// <param name="filePath">The input file path (can be absolute, relative, or StreamingAssets path)</param>
+        /// <returns>Resolved absolute file path</returns>
+        private static string ResolveFilePath(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+                return filePath;
+
+            // Check if it's already an absolute path
+            if (Path.IsPathRooted(filePath))
+            {
+                // Check if it's an Editor-style StreamingAssets path (starts with "Assets/StreamingAssets")
+                if (filePath.StartsWith("Assets/StreamingAssets/", StringComparison.OrdinalIgnoreCase) ||
+                    filePath.StartsWith("Assets\\StreamingAssets\\", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Extract the relative path after "Assets/StreamingAssets/"
+                    string relativePath = filePath.Substring("Assets/StreamingAssets/".Length);
+                    return Path.Combine(Application.streamingAssetsPath, relativePath);
+                }
+
+                // It's a regular absolute path, return as-is
+                return filePath;
+            }
+
+            // Check if it starts with "StreamingAssets/" (without "Assets/")
+            if (filePath.StartsWith("StreamingAssets/", StringComparison.OrdinalIgnoreCase) ||
+                filePath.StartsWith("StreamingAssets\\", StringComparison.OrdinalIgnoreCase))
+            {
+                // Extract the relative path after "StreamingAssets/"
+                string relativePath = filePath.Substring("StreamingAssets/".Length);
+                return Path.Combine(Application.streamingAssetsPath, relativePath);
+            }
+
+            // Otherwise, treat it as a relative path from StreamingAssets
+            // This allows users to just specify the filename if it's in StreamingAssets root
+            string streamingPath = Path.Combine(Application.streamingAssetsPath, filePath);
+            if (File.Exists(streamingPath))
+                return streamingPath;
+
+            // If not found in StreamingAssets, treat as relative to current directory
+            // or return the original path and let the caller handle the error
+            return Path.GetFullPath(filePath);
         }
     }
 }
