@@ -256,6 +256,8 @@ GameObject:
   m_Component:
   - component: {fileID: 464791314}
   - component: {fileID: 464791315}
+  - component: {fileID: 464791317}
+  - component: {fileID: 464791316}
   m_Layer: 0
   m_Name: GameObject
   m_TagString: Untagged
@@ -287,13 +289,57 @@ MonoBehaviour:
   m_GameObject: {fileID: 464791312}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: afd7657d0061a7848b269f3a4efccc7a, type: 3}
+  m_Script: {fileID: 11500000, guid: bdb674da9ff424c48bdcd8e191f7f782, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GaussianSplatting.Samples.LoadAndExportExample
   inputFilePath: path/to/your/file.ply
+  importFilePath: path/to/your/file.gsplat
   outputFileName: exported_gaussian_splat.gsplat
   quality: 2
   loadedAsset: {fileID: 0}
+  targetRenderer: {fileID: 464791317}
+--- !u!114 &464791316
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 464791312}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b9344df23bed5464c9e1e40f77e03e0b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: GaussianSplatting::GaussianSplatting.Runtime.GaussianSplatSettings
+  m_Transparency: 1
+  m_TemporalFilter: 0
+  m_FrameInfluence: 0.05
+  m_VarianceClampScale: 1.5
+  m_RenderMode: 0
+  m_PointDisplaySize: 3
+  m_SHOnly: 0
+  m_EnableOctreeCulling: 1
+  m_OctreeMaxDepth: 5
+  m_OctreeMaxSplatsPerLeaf: 1
+  m_OctreeCullingUpdateInterval: 1
+  m_OctreeSplatRatio: 0.9
+  m_DrawOctreeGizmos: 1
+--- !u!114 &464791317
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 464791312}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c12d929a7f62c48adbe9ff45c9a33ff0, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: GaussianSplatting::GaussianSplatting.Runtime.GaussianSplatRenderer
+  m_Asset: {fileID: 0}
+  m_RenderOrder: 0
+  m_SplatScale: 1
+  m_OpacityScale: 1
+  m_SHOrder: 3
 --- !u!1 &961739749
 GameObject:
   m_ObjectHideFlags: 0
@@ -306,6 +352,7 @@ GameObject:
   - component: {fileID: 961739752}
   - component: {fileID: 961739751}
   - component: {fileID: 961739750}
+  - component: {fileID: 961739754}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -431,6 +478,23 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &961739754
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 961739749}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 618b0e3f6c65dd247a4a016150006c57, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Unity.RenderPipelines.Core.Runtime::UnityEngine.Rendering.FreeCamera
+  m_LookSpeedController: 120
+  m_LookSpeedMouse: 4
+  m_MoveSpeed: 10
+  m_MoveSpeedIncrement: 2.5
+  m_Turbo: 10
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
