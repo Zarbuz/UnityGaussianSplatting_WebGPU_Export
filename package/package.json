@@ -7,6 +7,13 @@
   "license": "MIT",
   "name": "org.nesnausk.gaussian-splatting",
   "repository": "github:aras-p/UnityGaussianSplatting",
+  "samples": [
+    {
+      "displayName": "Load and Export Example",
+      "description": "Example showing how to load PLY/SPZ files and export to optimized .gsplat format. Includes WebGL support with file picker and browser download.",
+      "path": "Samples/Load and Export Example"
+    }
+  ],
   "unity": "2022.3",
   "unityRelease": "7f1",
   "version": "1.1.1"

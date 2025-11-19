@@ -328,9 +328,10 @@ namespace GaussianSplatting.Runtime
         /// Exports a runtime GaussianSplatAsset to a binary file.
         /// This allows fast loading without re-conversion from PLY/SPZ.
         /// File format: Header + metadata + 5 data chunks (chunk, pos, other, color, sh)
+        /// On WebGL, triggers a browser download instead of saving to disk.
         /// </summary>
         /// <param name="asset">The asset to export (must have runtime data)</param>
-        /// <param name="outputPath">Output file path (.gsplat extension recommended)</param>
+        /// <param name="outputPath">Output file path (.gsplat extension recommended). On WebGL, only the filename is used.</param>
         public static async Task ExportAssetAsync(GaussianSplatAsset asset, string outputPath)
         {
             if (asset == null)
@@ -339,8 +340,28 @@ namespace GaussianSplatting.Runtime
             if (!asset.m_RuntimePosData.IsCreated)
                 throw new InvalidOperationException("Asset has no runtime data to export. Only runtime-loaded assets can be exported.");
 
+#if UNITY_WEBGL && !UNITY_EDITOR
+            // For WebGL, write directly in chunks to avoid huge memory allocation
+            string fileName = Path.GetFileName(outputPath);
+            await WriteAssetDataChunkedAsync(asset, fileName);
+            Debug.Log($"Downloaded GaussianSplatAsset as {fileName}");
+#else
+            // For other platforms, save to file system
             using (var fileStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write))
-            using (var writer = new BinaryWriter(fileStream))
+            {
+                await WriteAssetDataAsync(asset, fileStream);
+            }
+
+            Debug.Log($"Exported GaussianSplatAsset to {outputPath} ({new FileInfo(outputPath).Length} bytes)");
+#endif
+        }
+
+        /// <summary>
+        /// Writes asset data to a stream (shared between file export and web download).
+        /// </summary>
+        private static async Task WriteAssetDataAsync(GaussianSplatAsset asset, Stream stream)
+        {
+            using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, true))
             {
                 // Write magic number and version
                 writer.Write(0x4C504753); // "GSPL" magic
@@ -397,9 +418,133 @@ namespace GaussianSplatting.Runtime
                 WriteDataChunk(asset.m_RuntimeSHData);
                 await Task.Yield();
             }
-
-            Debug.Log($"Exported GaussianSplatAsset to {outputPath} ({new FileInfo(outputPath).Length} bytes)");
         }
+
+#if UNITY_WEBGL && !UNITY_EDITOR
+        /// <summary>
+        /// WebGL chunked download functions.
+        /// </summary>
+        [System.Runtime.InteropServices.DllImport("__Internal")]
+        private static extern void DownloadFileBegin(string fileName);
+
+        [System.Runtime.InteropServices.DllImport("__Internal")]
+        private static extern bool DownloadFileAddChunk(string fileName, System.IntPtr dataPtr, int dataLength);
+
+        [System.Runtime.InteropServices.DllImport("__Internal")]
+        private static extern bool DownloadFileEnd(string fileName);
+
+        /// <summary>
+        /// Writes asset data in chunks for WebGL to avoid large memory allocation.
+        /// </summary>
+        private static async Task WriteAssetDataChunkedAsync(GaussianSplatAsset asset, string fileName)
+        {
+            const int CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks
+
+            // Begin download
+            DownloadFileBegin(fileName);
+
+            // Helper function (not used but kept for reference)
+            // Data is written directly via DownloadFileAddChunk calls
+
+            // Write header and metadata to a small buffer
+            using (var headerStream = new MemoryStream())
+            using (var writer = new BinaryWriter(headerStream))
+            {
+                // Write magic number and version
+                writer.Write(0x4C504753); // "GSPL" magic
+                writer.Write(1); // Format version
+
+                // Write metadata
+                writer.Write(asset.formatVersion);
+                writer.Write(asset.splatCount);
+                writer.Write(asset.boundsMin.x);
+                writer.Write(asset.boundsMin.y);
+                writer.Write(asset.boundsMin.z);
+                writer.Write(asset.boundsMax.x);
+                writer.Write(asset.boundsMax.y);
+                writer.Write(asset.boundsMax.z);
+                writer.Write((int)asset.posFormat);
+                writer.Write((int)asset.scaleFormat);
+                writer.Write((int)asset.colorFormat);
+                writer.Write((int)asset.shFormat);
+
+                // Write data hash
+                unsafe
+                {
+                    Hash128 hash = asset.dataHash;
+                    byte* hashPtr = (byte*)&hash;
+                    for (int i = 0; i < 16; i++)
+                        writer.Write(hashPtr[i]);
+                }
+
+                // Send header chunk
+                byte[] headerData = headerStream.ToArray();
+                unsafe
+                {
+                    fixed (byte* ptr = headerData)
+                    {
+                        DownloadFileAddChunk(fileName, (System.IntPtr)ptr, headerData.Length);
+                    }
+                }
+            }
+
+            await Task.Yield();
+
+            // Helper to write NativeArray<byte> in chunks
+            unsafe void WriteDataChunkInParts(NativeArray<byte> data)
+            {
+                // Write length first
+                using (var lengthStream = new MemoryStream())
+                using (var lengthWriter = new BinaryWriter(lengthStream))
+                {
+                    lengthWriter.Write(data.Length);
+                    byte[] lengthData = lengthStream.ToArray();
+                    fixed (byte* ptr = lengthData)
+                    {
+                        DownloadFileAddChunk(fileName, (System.IntPtr)ptr, lengthData.Length);
+                    }
+                }
+
+                if (data.Length == 0)
+                    return;
+
+                // Write data in chunks
+                byte* dataPtr = (byte*)data.GetUnsafeReadOnlyPtr();
+                int remaining = data.Length;
+                int offset = 0;
+
+                while (remaining > 0)
+                {
+                    int chunkSize = System.Math.Min(CHUNK_SIZE, remaining);
+
+                    // Pass pointer directly to avoid allocating managed array
+                    DownloadFileAddChunk(fileName, (System.IntPtr)(dataPtr + offset), chunkSize);
+
+                    offset += chunkSize;
+                    remaining -= chunkSize;
+                }
+            }
+
+            // Write all data chunks
+            WriteDataChunkInParts(asset.m_RuntimeChunkData.IsCreated ? asset.m_RuntimeChunkData : default);
+            await Task.Yield();
+
+            WriteDataChunkInParts(asset.m_RuntimePosData);
+            await Task.Yield();
+
+            WriteDataChunkInParts(asset.m_RuntimeOtherData);
+            await Task.Yield();
+
+            WriteDataChunkInParts(asset.m_RuntimeColorData);
+            await Task.Yield();
+
+            WriteDataChunkInParts(asset.m_RuntimeSHData);
+            await Task.Yield();
+
+            // Finalize download
+            DownloadFileEnd(fileName);
+        }
+#endif
 
         /// <summary>
         /// Imports a GaussianSplatAsset from an exported binary file.

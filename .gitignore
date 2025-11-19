@@ -33,3 +33,5 @@ projects/GaussianExample-URP/MemoryCaptures/
 *.ply
 projects/GaussianExample-URP/Assets/StreamingAssets/
 projects/GaussianExample-URP/Assets/StreamingAssets.meta
+projects/GaussianExample-URP/Assets/Samples/
+projects/GaussianExample-URP/Assets/Samples.meta
