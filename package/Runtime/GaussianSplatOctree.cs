@@ -123,6 +123,20 @@ namespace GaussianSplatting.Runtime
         bool m_SortOutliers;
 		Vector3 m_SortJobCameraPosition;
 
+        // Cache to avoid redundant GPU uploads
+        int m_LastUploadedSplatCount;
+        bool m_BufferNeedsUpload;
+
+        // Cache previous frame data to skip redundant work
+        Vector3 m_LastCullCameraPosition;
+        Quaternion m_LastCullCameraRotation;
+        float m_CullUpdateThreshold = 0.01f; // Skip culling if camera moved less than this
+
+        // Pooled job arrays to avoid per-frame allocations (optimization 4)
+        NativeArray<UnsafeList<int>> m_CachedNodeSplatListPointers;
+        NativeArray<GaussianSplatBurstSorting.NodeSortRange> m_CachedNodeRanges;
+        bool m_JobArraysValid;
+
         // Global native positions buffer (all splat positions) to avoid per-job copying
         NativeArray<float3> m_AllPositionsNative;
         bool m_AllPositionsNativeValid;
@@ -154,7 +168,7 @@ namespace GaussianSplatting.Runtime
                 {
                     try { m_VisibleSplatIndices.Dispose(); } catch {}
                 }
-                
+
                 // Allocate with some extra space to avoid frequent reallocations
                 int bufferSize = Mathf.NextPowerOfTwo(Mathf.Max(requiredCapacity, 1));
                 try
@@ -166,6 +180,39 @@ namespace GaussianSplatting.Runtime
                 {
                     Debug.LogError($"Failed to allocate visible splat indices native array: {ex.Message}");
                     m_VisibleSplatIndicesValid = false;
+                }
+            }
+        }
+
+        // Helper to ensure pooled job arrays are large enough (optimization 4)
+        void EnsureJobArraysCapacity(int requiredCapacity)
+        {
+            if (!m_JobArraysValid || !m_CachedNodeSplatListPointers.IsCreated || m_CachedNodeSplatListPointers.Length < requiredCapacity)
+            {
+                if (m_JobArraysValid)
+                {
+                    if (m_CachedNodeSplatListPointers.IsCreated)
+                    {
+                        try { m_CachedNodeSplatListPointers.Dispose(); } catch {}
+                    }
+                    if (m_CachedNodeRanges.IsCreated)
+                    {
+                        try { m_CachedNodeRanges.Dispose(); } catch {}
+                    }
+                }
+
+                // Allocate with power-of-2 size to reduce reallocations
+                int bufferSize = Mathf.NextPowerOfTwo(Mathf.Max(requiredCapacity, 64));
+                try
+                {
+                    m_CachedNodeSplatListPointers = new NativeArray<UnsafeList<int>>(bufferSize, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    m_CachedNodeRanges = new NativeArray<GaussianSplatBurstSorting.NodeSortRange>(bufferSize, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                    m_JobArraysValid = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"Failed to allocate pooled job arrays: {ex.Message}");
+                    m_JobArraysValid = false;
                 }
             }
         }
@@ -900,15 +947,7 @@ namespace GaussianSplatting.Runtime
                 m_SortJobRunning = false;
             }
 
-            // Dispose job data
-            if (m_NodeSplatListPointers.IsCreated)
-            {
-                try { m_NodeSplatListPointers.Dispose(); } catch {}
-            }
-            if (m_NodeRanges.IsCreated)
-            {
-                try { m_NodeRanges.Dispose(); } catch {}
-            }
+            // Dispose job data (but not slices of cached arrays)
             if (m_NodesToSort.IsCreated)
             {
                 try { m_NodesToSort.Dispose(); } catch {}
@@ -953,6 +992,20 @@ namespace GaussianSplatting.Runtime
                 m_AllPositionsNativeValid = false;
             }
 
+            // Dispose pooled job arrays (optimization 4)
+            if (m_JobArraysValid)
+            {
+                if (m_CachedNodeSplatListPointers.IsCreated)
+                {
+                    try { m_CachedNodeSplatListPointers.Dispose(); } catch {}
+                }
+                if (m_CachedNodeRanges.IsCreated)
+                {
+                    try { m_CachedNodeRanges.Dispose(); } catch {}
+                }
+                m_JobArraysValid = false;
+            }
+
             m_TotalSplats = 0;
         }
 
@@ -971,6 +1024,7 @@ namespace GaussianSplatting.Runtime
             if (!m_Built)
                 return;
             var camPosition = camera.transform.position;
+            var camRotation = camera.transform.rotation;
 
             if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
             {
@@ -978,25 +1032,48 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
-            // Ensure m_VisibleNodeRefs is created
-            if (!m_VisibleNodeRefsValid || !m_VisibleNodeRefs.IsCreated)
+            // Early exit: skip frustum culling if camera hasn't moved much
+            // This is a huge optimization - frustum culling is expensive!
+            bool needsCulling = true;
+            float positionDelta = Vector3.Distance(camPosition, m_LastCullCameraPosition);
+            float rotationDelta = Quaternion.Angle(camRotation, m_LastCullCameraRotation);
+
+            if (positionDelta < m_CullUpdateThreshold && rotationDelta < 0.5f)
             {
-                if (m_VisibleNodeRefsValid && m_VisibleNodeRefs.IsCreated)
-                    m_VisibleNodeRefs.Dispose();
-                m_VisibleNodeRefs = new NativeList<VisibleNodeRef>(256, Allocator.Persistent);
-                m_VisibleNodeRefsValid = true;
-            }
-            else
-            {
-                m_VisibleNodeRefs.Clear();
+                // Camera barely moved, skip expensive culling but still check for completed sort jobs
+                needsCulling = false;
             }
 
-            // Calculate frustum planes into reusable array to avoid GC allocation
-            GeometryUtility.CalculateFrustumPlanes(camera, m_FrustumPlanes);
-            CollectVisibleNodesWithDistance(0, m_FrustumPlanes, camPosition);
+            if (needsCulling)
+            {
+                // Ensure m_VisibleNodeRefs is created
+                if (!m_VisibleNodeRefsValid || !m_VisibleNodeRefs.IsCreated)
+                {
+                    if (m_VisibleNodeRefsValid && m_VisibleNodeRefs.IsCreated)
+                        m_VisibleNodeRefs.Dispose();
+                    m_VisibleNodeRefs = new NativeList<VisibleNodeRef>(256, Allocator.Persistent);
+                    m_VisibleNodeRefsValid = true;
+                }
+                else
+                {
+                    m_VisibleNodeRefs.Clear();
+                }
 
-            // Sort node references by distance (front-to-back)
-            m_VisibleNodeRefs.AsArray().Sort(new VisibleNodeRefDistanceComparer());
+                // Calculate frustum planes into reusable array to avoid GC allocation
+                GeometryUtility.CalculateFrustumPlanes(camera, m_FrustumPlanes);
+                CollectVisibleNodesWithDistance(0, m_FrustumPlanes, camPosition);
+
+                m_LastCullCameraPosition = camPosition;
+                m_LastCullCameraRotation = camRotation;
+            }
+
+            // Sort node references by distance (front-to-back) using Burst-optimized sort
+            // Only sort if we did culling (otherwise list is unchanged)
+            if (needsCulling && m_VisibleNodeRefs.Length > 1)
+            {
+                // Use native sorting for better performance
+                m_VisibleNodeRefs.AsArray().Sort(new VisibleNodeRefDistanceComparer());
+            }
 
             // ASYNC STRATEGY (fully non-blocking):
             // Frame N:   Build indices from node data (sorted in frame N-1 or earlier)
@@ -1009,64 +1086,84 @@ namespace GaussianSplatting.Runtime
             // The slight latency is acceptable since sorting is a rendering optimization.
 
             // Build visible splat indices from CURRENT node data
-            int currentIndex = 0;
-
-            // First, add node splats (front elements for front-to-back rendering)
-            for (int i = 0; i < m_VisibleNodeRefs.Length; i++)
+            // Skip if culling was skipped (nothing changed)
+            if (needsCulling)
             {
-                var nodeRef = m_VisibleNodeRefs[i];
-                var node = m_Nodes[nodeRef.nodeIndex];
-                if (node.splatIndices.IsCreated && node.splatIndices.Length > 0)
+                int currentIndex = 0;
+
+                // First, add node splats (front elements for front-to-back rendering)
+                for (int i = 0; i < m_VisibleNodeRefs.Length; i++)
                 {
-                    // Ensure we have enough space
-                    if (currentIndex + node.splatIndices.Length > m_VisibleSplatIndices.Length)
+                    var nodeRef = m_VisibleNodeRefs[i];
+                    var node = m_Nodes[nodeRef.nodeIndex];
+                    if (node != null && node.splatIndices.IsCreated && node.splatIndices.Length > 0)
                     {
+                        // Ensure we have enough space
+                        if (currentIndex + node.splatIndices.Length > m_VisibleSplatIndices.Length)
+                        {
+                            if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
+                            {
+                                visibleSplatCount = currentIndex;
+                                if (m_BufferNeedsUpload || m_LastUploadedSplatCount != visibleSplatCount)
+                                {
+                                    UpdateVisibleIndicesBuffer();
+                                    m_LastUploadedSplatCount = visibleSplatCount;
+                                    m_BufferNeedsUpload = false;
+                                }
+                                return;
+                            }
+                        }
+
+                        // Copy node splat indices using bulk memory copy (much faster than loop)
+                        NativeArray<int>.Copy(node.splatIndices.AsArray(), 0, m_VisibleSplatIndices, currentIndex, node.splatIndices.Length);
+                        currentIndex += node.splatIndices.Length;
+                    }
+                }
+
+                // Finally, add outliers (background elements for front-to-back rendering)
+                if (m_OthersIndices.Length > 0)
+                {
+                    if (currentIndex + m_OthersIndices.Length > m_VisibleSplatIndices.Length)
+                    {
+                        EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Length);
                         if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
                         {
                             visibleSplatCount = currentIndex;
-                            UpdateVisibleIndicesBuffer();
+                            if (m_BufferNeedsUpload || m_LastUploadedSplatCount != visibleSplatCount)
+                            {
+                                UpdateVisibleIndicesBuffer();
+                                m_LastUploadedSplatCount = visibleSplatCount;
+                                m_BufferNeedsUpload = false;
+                            }
                             return;
                         }
                     }
 
-                    // Copy node splat indices
-                    for (int j = 0; j < node.splatIndices.Length; j++)
-                    {
-                        m_VisibleSplatIndices[currentIndex + j] = node.splatIndices[j];
-                    }
-                    currentIndex += node.splatIndices.Length;
+                    // Copy outliers using bulk memory copy (much faster than loop)
+                    NativeArray<int>.Copy(m_OthersIndices.AsArray(), 0, m_VisibleSplatIndices, currentIndex, m_OthersIndices.Length);
+                    currentIndex += m_OthersIndices.Length;
                 }
+
+                visibleSplatCount = currentIndex;
+                m_BufferNeedsUpload = true; // Mark for upload since we rebuilt the list
             }
-
-            // Finally, add outliers (background elements for front-to-back rendering)
-            if (m_OthersIndices.Length > 0)
-            {
-                if (currentIndex + m_OthersIndices.Length > m_VisibleSplatIndices.Length)
-                {
-                    EnsureVisibleSplatIndicesCapacity(currentIndex + m_OthersIndices.Length);
-                    if (!m_VisibleSplatIndicesValid || !m_VisibleSplatIndices.IsCreated)
-                    {
-                        visibleSplatCount = currentIndex;
-                        UpdateVisibleIndicesBuffer();
-                        return;
-                    }
-                }
-
-                for (int i = 0; i < m_OthersIndices.Length; i++)
-                {
-                    m_VisibleSplatIndices[currentIndex + i] = m_OthersIndices[i];
-                }
-                currentIndex += m_OthersIndices.Length;
-            }
-
-            visibleSplatCount = currentIndex;
-            UpdateVisibleIndicesBuffer();
 
             // Complete previous job if it's ready (non-blocking check)
             // This applies the sorted results to the node data
+            bool sortCompleted = false;
             if (m_SortJobRunning && m_SortJobHandle.IsCompleted)
             {
                 CompleteSortJob(m_SortJobCameraPosition);
+                sortCompleted = true;
+                m_BufferNeedsUpload = true; // Data changed, need GPU upload
+            }
+
+            // Only upload to GPU if data changed or count changed
+            if (m_BufferNeedsUpload || m_LastUploadedSplatCount != visibleSplatCount)
+            {
+                UpdateVisibleIndicesBuffer();
+                m_LastUploadedSplatCount = visibleSplatCount;
+                m_BufferNeedsUpload = false;
             }
 
             // Only schedule a new job if no job is currently running
@@ -1097,7 +1194,8 @@ namespace GaussianSplatting.Runtime
         /// <summary>
         /// Schedule Burst-compiled parallel sorting jobs for all visible nodes and outliers.
         /// Uses IJobParallelFor for true parallel execution across CPU cores.
-        /// Sorts data in-place within NativeLists using optimized radix sort - zero GC allocation.
+        /// Sorts data in-place within NativeLists using optimized hybrid sort - zero GC allocation.
+        /// Optimized with pooled arrays and work-weighted batch sizing (optimizations 4 & 5).
         /// </summary>
         void ScheduleBurstSortJobs(Vector3 camPosition)
         {
@@ -1145,28 +1243,44 @@ namespace GaussianSplatting.Runtime
                 return;
             }
 
-            // Create arrays for in-place sorting
-            m_NodeSplatListPointers = new NativeArray<UnsafeList<int>>(totalJobCount, Allocator.Persistent);
-            m_NodeRanges = new NativeArray<GaussianSplatBurstSorting.NodeSortRange>(totalJobCount, Allocator.Persistent);
+            // Use pooled arrays instead of allocating new ones (optimization 4)
+            EnsureJobArraysCapacity(totalJobCount);
+
+            if (!m_JobArraysValid)
+            {
+                Debug.LogError("Failed to allocate job arrays for sorting");
+                m_NodesToSort.Dispose();
+                return;
+            }
+
+            // Reuse cached arrays by creating slices
+            m_NodeSplatListPointers = m_CachedNodeSplatListPointers.GetSubArray(0, totalJobCount);
+            m_NodeRanges = m_CachedNodeRanges.GetSubArray(0, totalJobCount);
 
             // Setup node pointers and ranges for in-place sorting
+            // Also calculate total work for batch size optimization (optimization 5)
+            int totalWork = 0;
+
             for (int i = 0; i < m_NodesToSort.Length; i++)
             {
                 int nodeIndex = m_NodesToSort[i];
+                var node = m_Nodes[nodeIndex];
+                int nodeCount = node.splatIndices.Length;
 
                 // Get unsafe pointer to the node's NativeList directly from the list
                 unsafe
                 {
-                    var nodeRef = m_Nodes[nodeIndex];
-                    m_NodeSplatListPointers[i] = *nodeRef.splatIndices.GetUnsafeList();
+                    m_NodeSplatListPointers[i] = *node.splatIndices.GetUnsafeList();
                 }
 
                 // Store range metadata
                 m_NodeRanges[i] = new GaussianSplatBurstSorting.NodeSortRange
                 {
                     nodeIndex = i,
-                    length = m_Nodes[nodeIndex].splatIndices.Length
+                    length = nodeCount
                 };
+
+                totalWork += nodeCount;
             }
 
             // Add outliers if needed
@@ -1182,9 +1296,11 @@ namespace GaussianSplatting.Runtime
                     nodeIndex = m_NodesToSort.Length,
                     length = m_OthersIndices.Length
                 };
+
+                totalWork += m_OthersIndices.Length;
             }
 
-            // Schedule the parallel radix sort job
+            // Schedule the parallel hybrid sort job
             var parallelSortJob = new GaussianSplatBurstSorting.RadixSortMultipleNodesJob
             {
                 nodeSplatLists = m_NodeSplatListPointers,
@@ -1193,10 +1309,16 @@ namespace GaussianSplatting.Runtime
                 cameraPosition = (float3)camPosition
             };
 
-            // Calculate optimal batch size for better load balancing
-            // Aim for 4x worker count to enable good work distribution
+            // Calculate optimal batch size using work-weighted approach (optimization 5)
+            // Target: Balance between job overhead and load balancing
+            // Aim for ~2000-5000 splats per batch for good CPU utilization
             int workerCount = Unity.Jobs.LowLevel.Unsafe.JobsUtility.JobWorkerCount;
-            int batchSize = Mathf.Max(1, totalJobCount / (workerCount * 4));
+            int targetSplatsPerBatch = 3000;
+            int idealBatchCount = Mathf.Max(workerCount, totalWork / targetSplatsPerBatch);
+            int batchSize = Mathf.Max(1, totalJobCount / idealBatchCount);
+
+            // Clamp batch size to reasonable bounds
+            batchSize = Mathf.Clamp(batchSize, 1, 32);
 
             // Schedule with parallel execution - DON'T complete yet
             m_SortJobHandle = parallelSortJob.Schedule(totalJobCount, batchSize);
@@ -1234,11 +1356,8 @@ namespace GaussianSplatting.Runtime
                 m_LastOthersSortCamPos = camPosition;
             }
 
-            // Cleanup job data
-            if (m_NodeSplatListPointers.IsCreated)
-                m_NodeSplatListPointers.Dispose();
-            if (m_NodeRanges.IsCreated)
-                m_NodeRanges.Dispose();
+            // Cleanup job data (but keep pooled arrays for reuse - optimization 4)
+            // m_NodeSplatListPointers and m_NodeRanges are slices of cached arrays, don't dispose
             if (m_NodesToSort.IsCreated)
                 m_NodesToSort.Dispose();
         }
@@ -1356,13 +1475,16 @@ namespace GaussianSplatting.Runtime
                     for (int i = node.childIndices.Length - 1; i >= 0; i--)
                     {
                         int childIndex = node.childIndices[i];
-                        if (childIndex < m_Nodes.Count)
+                        if (childIndex >= 0 && childIndex < m_Nodes.Count)
                         {
                             var childNode = m_Nodes[childIndex];
-                            // Only traverse children that have content or are internal nodes
-                            if ((childNode.splatIndices.IsCreated && childNode.splatIndices.Length > 0) || !childNode.isLeaf)
+                            if (childNode != null)
                             {
-                                m_TraversalStack.Push(childIndex);
+                                // Only traverse children that have content or are internal nodes
+                                if ((childNode.splatIndices.IsCreated && childNode.splatIndices.Length > 0) || !childNode.isLeaf)
+                                {
+                                    m_TraversalStack.Push(childIndex);
+                                }
                             }
                         }
                     }

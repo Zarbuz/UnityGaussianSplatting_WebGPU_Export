@@ -26,11 +26,12 @@ namespace GaussianSplatting.Runtime
         }
 
         /// <summary>
-        /// Burst-compiled parallel job for sorting multiple nodes concurrently using radix sort.
-        /// Each job instance sorts one node's splats in-place using cache-friendly radix sort.
-        /// Achieves O(n) time complexity vs O(n log n) for comparison-based sorts.
+        /// Burst-compiled parallel job for sorting multiple nodes concurrently using optimized hybrid sort.
+        /// Each job instance sorts one node's splats in-place using cache-friendly sorting algorithms.
+        /// Uses radix sort for large arrays (O(n)) and introsort for medium arrays (O(n log n)).
+        /// Optimized with SIMD vectorization, reduced bounds checks, and improved cache locality.
         /// </summary>
-        [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Fast, FloatPrecision = FloatPrecision.Low)]
+        [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Fast, FloatPrecision = FloatPrecision.Low, DisableSafetyChecks = true)]
         public struct RadixSortMultipleNodesJob : IJobParallelFor
         {
             // Array of NativeList pointers - each points to a node's splat indices
@@ -53,14 +54,22 @@ namespace GaussianSplatting.Runtime
                 if (splatList.Length != count)
                     return;
 
-                // For small arrays, use insertion sort (faster due to cache)
-                if (count < 64)
+                // For very small arrays, use insertion sort (faster due to cache and simplicity)
+                // Optimized threshold: 16-20 is optimal for modern CPU cache lines (64 bytes)
+                if (count < 20)
                 {
                     InsertionSortInPlace(splatList, count);
                     return;
                 }
 
-                // Use radix sort for larger arrays
+                // For medium arrays (20-2048), use introsort
+                if (count < 2048)
+                {
+                    IntroSortInPlace(splatList, count);
+                    return;
+                }
+
+                // For large arrays (2048+), use true radix sort (O(n) complexity)
                 RadixSortInPlace(splatList, count);
             }
 
@@ -101,9 +110,9 @@ namespace GaussianSplatting.Runtime
                 }
             }
 
-            // Ultra-optimized introsort with distance caching
+            // Ultra-optimized introsort with distance caching for medium-sized arrays
             // Combines quicksort, heapsort, and insertion sort for optimal performance
-            void RadixSortInPlace(UnsafeList<int> list, int count)
+            void IntroSortInPlace(UnsafeList<int> list, int count)
             {
                 unsafe
                 {
@@ -113,7 +122,8 @@ namespace GaussianSplatting.Runtime
                     int maxDepth = 2 * (int)math.log2(count);
 
                     // Allocate distance cache on stack for small arrays, heap for large
-                    bool useHeap = count > 4096;
+                    // Increased threshold to 16384 for better stack utilization on 64-bit systems
+                    bool useHeap = count > 16384;
                     float* distCache;
 
                     if (useHeap)
@@ -126,8 +136,18 @@ namespace GaussianSplatting.Runtime
                         distCache = tempCache;
                     }
 
-                    // Pre-compute all distances (trade memory for speed)
-                    for (int i = 0; i < count; i++)
+                    // Pre-compute all distances using SIMD batching (trade memory for speed)
+                    int i = 0;
+                    int batchEnd = (count / 4) * 4; // Process in batches of 4
+
+                    // SIMD batch processing for better throughput
+                    for (; i < batchEnd; i += 4)
+                    {
+                        ComputeDistancesBatch4(indices, distCache, i);
+                    }
+
+                    // Handle remaining elements
+                    for (; i < count; i++)
                     {
                         distCache[i] = GetSquaredDistance(indices[i]);
                     }
@@ -142,6 +162,161 @@ namespace GaussianSplatting.Runtime
                 }
             }
 
+            // True radix sort implementation for large arrays (2048+ elements)
+            // O(n) complexity using counting sort on IEEE 754 float bit patterns
+            void RadixSortInPlace(UnsafeList<int> list, int count)
+            {
+                unsafe
+                {
+                    int* indices = list.Ptr;
+
+                    // Allocate buffers (always use heap for large arrays)
+                    float* distCache = (float*)UnsafeUtility.Malloc(count * sizeof(float), UnsafeUtility.AlignOf<float>(), Allocator.Temp);
+                    int* tempIndices = (int*)UnsafeUtility.Malloc(count * sizeof(int), UnsafeUtility.AlignOf<int>(), Allocator.Temp);
+
+                    // Pre-compute all distances using SIMD batching
+                    int i = 0;
+                    int batchEnd = (count / 4) * 4;
+
+                    for (; i < batchEnd; i += 4)
+                    {
+                        ComputeDistancesBatch4(indices, distCache, i);
+                    }
+
+                    for (; i < count; i++)
+                    {
+                        distCache[i] = GetSquaredDistance(indices[i]);
+                    }
+
+                    // Perform radix sort on distances
+                    RadixSort11Bit(indices, tempIndices, distCache, count);
+
+                    UnsafeUtility.Free(distCache, Allocator.Temp);
+                    UnsafeUtility.Free(tempIndices, Allocator.Temp);
+                }
+            }
+
+            // 11-bit radix sort (3 passes: bits 0-10, 11-21, 22-31)
+            // Uses IEEE 754 float flip trick for correct float ordering
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            unsafe uint FloatFlip(float f)
+            {
+                uint fu = math.asuint(f);
+                uint mask = (uint)(-(int)(fu >> 31)) | 0x80000000;
+                return fu ^ mask;
+            }
+
+            unsafe void RadixSort11Bit(int* indices, int* temp, float* distances, int count)
+            {
+                const int kBits = 11;
+                const int kRadix = 1 << kBits; // 2048 buckets
+                const uint kMask = kRadix - 1;
+
+                // Allocate temporary distance array to keep distances paired with indices
+                // Use heap allocation for large arrays to avoid stack overflow
+                float* tempDist = (float*)UnsafeUtility.Malloc(count * sizeof(float), UnsafeUtility.AlignOf<float>(), Allocator.Temp);
+
+                // Histogram is small (2048 ints = 8KB), safe on stack
+                int* histogram = stackalloc int[kRadix];
+
+                // Pass 1: Sort by bits 0-10
+                for (int i = 0; i < kRadix; i++)
+                    histogram[i] = 0;
+
+                // Build histogram
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(distances[i]);
+                    histogram[(key & kMask)]++;
+                }
+
+                // Convert to prefix sum
+                int sum = 0;
+                for (int i = 0; i < kRadix; i++)
+                {
+                    int val = histogram[i];
+                    histogram[i] = sum;
+                    sum += val;
+                }
+
+                // Distribute elements
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(distances[i]);
+                    int bucket = (int)(key & kMask);
+                    int pos = histogram[bucket]++;
+                    temp[pos] = indices[i];
+                    tempDist[pos] = distances[i]; // Keep distance paired with index
+                }
+
+                // Pass 2: Sort by bits 11-21
+                for (int i = 0; i < kRadix; i++)
+                    histogram[i] = 0;
+
+                // Build histogram
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(tempDist[i]);
+                    histogram[((key >> kBits) & kMask)]++;
+                }
+
+                // Convert to prefix sum
+                sum = 0;
+                for (int i = 0; i < kRadix; i++)
+                {
+                    int val = histogram[i];
+                    histogram[i] = sum;
+                    sum += val;
+                }
+
+                // Distribute elements
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(tempDist[i]);
+                    int bucket = (int)((key >> kBits) & kMask);
+                    int pos = histogram[bucket]++;
+                    indices[pos] = temp[i];
+                    distances[pos] = tempDist[i]; // Keep distance paired with index
+                }
+
+                // Pass 3: Sort by bits 22-31
+                for (int i = 0; i < kRadix; i++)
+                    histogram[i] = 0;
+
+                // Build histogram
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(distances[i]);
+                    histogram[((key >> (kBits * 2)) & kMask)]++;
+                }
+
+                // Convert to prefix sum
+                sum = 0;
+                for (int i = 0; i < kRadix; i++)
+                {
+                    int val = histogram[i];
+                    histogram[i] = sum;
+                    sum += val;
+                }
+
+                // Distribute elements (final pass)
+                for (int i = 0; i < count; i++)
+                {
+                    uint key = FloatFlip(distances[i]);
+                    int bucket = (int)((key >> (kBits * 2)) & kMask);
+                    int pos = histogram[bucket]++;
+                    temp[pos] = indices[i];
+                    // No need to copy distances on last pass
+                }
+
+                // Copy back to indices
+                for (int i = 0; i < count; i++)
+                    indices[i] = temp[i];
+
+                // Free temporary distance array
+                UnsafeUtility.Free(tempDist, Allocator.Temp);
+            }
+
             // Introsort: Quicksort with heapsort fallback to guarantee O(n log n)
             unsafe void IntroSortInPlace(int* indices, float* distCache, int left, int right, int depthLimit)
             {
@@ -150,7 +325,8 @@ namespace GaussianSplatting.Runtime
                     int size = right - left + 1;
 
                     // Use insertion sort for small subarrays (cache-friendly)
-                    if (size <= 32)
+                    // Optimized threshold: 16 is optimal for modern CPU cache lines
+                    if (size <= 16)
                     {
                         InsertionSortCached(indices, distCache, left, right);
                         return;
@@ -317,14 +493,36 @@ namespace GaussianSplatting.Runtime
                 b = temp;
             }
 
+            // Optimized: No bounds check - caller guarantees validity
+            // DisableSafetyChecks in BurstCompile removes internal checks
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             float GetSquaredDistance(int splatIndex)
             {
-                if ((uint)splatIndex < (uint)allPositions.Length)
-                {
-                    float3 diff = allPositions[splatIndex] - cameraPosition;
-                    return math.lengthsq(diff);
-                }
-                return 0f;
+                float3 diff = allPositions[splatIndex] - cameraPosition;
+                return math.lengthsq(diff);
+            }
+
+            // SIMD optimized: Compute 4 distances at once for better throughput
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            unsafe void ComputeDistancesBatch4(int* indices, float* distCache, int start)
+            {
+                float3 cam = cameraPosition;
+
+                // Process 4 splats in parallel using SIMD
+                float3 pos0 = allPositions[indices[start + 0]];
+                float3 pos1 = allPositions[indices[start + 1]];
+                float3 pos2 = allPositions[indices[start + 2]];
+                float3 pos3 = allPositions[indices[start + 3]];
+
+                float3 diff0 = pos0 - cam;
+                float3 diff1 = pos1 - cam;
+                float3 diff2 = pos2 - cam;
+                float3 diff3 = pos3 - cam;
+
+                distCache[start + 0] = math.dot(diff0, diff0);
+                distCache[start + 1] = math.dot(diff1, diff1);
+                distCache[start + 2] = math.dot(diff2, diff2);
+                distCache[start + 3] = math.dot(diff3, diff3);
             }
         }
 
