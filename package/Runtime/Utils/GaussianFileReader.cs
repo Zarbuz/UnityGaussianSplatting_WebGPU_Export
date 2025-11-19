@@ -51,6 +51,9 @@ namespace GaussianSplatting.Runtime.Utils
                     throw new IOException($"PLY file is probably not a Gaussian Splat file? Missing properties: {attrError}");
                 splats = PLYDataToSplats(plyRawData, splatCount, vertexStride, attributes);
 
+                // Dispose plyRawData immediately after conversion to free ~248MB per 1M splats
+                plyRawData.Dispose();
+
                 int shCount = 15;   //default 15
                 // Count how many f_rest_* attributes are present
                 int restCount = attributes.Count(a => a.Item1.StartsWith("f_rest_") && a.Item2 == PLYFileReader.ElementType.Float);
@@ -76,6 +79,9 @@ namespace GaussianSplatting.Runtime.Utils
                 if (!string.IsNullOrEmpty(attrError))
                     throw new IOException($"PLY data is probably not a Gaussian Splat file? Missing properties: {attrError}");
                 splats = PLYDataToSplats(plyRawData, splatCount, vertexStride, attributes);
+
+                // Dispose plyRawData immediately after conversion to free ~248MB per 1M splats
+                plyRawData.Dispose();
 
                 int shCount = 15;   //default 15
                 // Count how many f_rest_* attributes are present
