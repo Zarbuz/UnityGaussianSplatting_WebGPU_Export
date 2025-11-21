@@ -62,6 +62,7 @@ namespace GaussianSplatting.Runtime
         int m_MaxSplatsPerLeaf;
         Bounds m_RootBounds;
         bool m_Built;
+        bool m_IsBuilding; // Track if a build is currently in progress
 
         // GPU buffer for visible splat indices (updated per frame/N frames)
         GraphicsBuffer m_VisibleIndicesBuffer;
@@ -278,24 +279,35 @@ namespace GaussianSplatting.Runtime
         /// <param name="splatPercent">Percentage of splats to include in octree</param>
         public async Task BuildAsync(NativeArray<float3> splatPositions, Bounds sceneBounds, float splatPercent)
         {
-            Clear();
-
-            if (splatPositions.Length == 0)
+            // Prevent concurrent builds that would dispose nodes while previous build is still running
+            if (m_IsBuilding)
             {
-                Debug.LogWarning("GaussianSplatOctree.Build: No splat positions provided");
+                Debug.LogWarning("GaussianSplatOctree.BuildAsync: Build already in progress, ignoring new build request");
                 return;
             }
 
-            Debug.Log($"Building octree with {splatPositions.Length} splats, bounds: {sceneBounds}");
+            m_IsBuilding = true;
 
-            int total = splatPositions.Length;
-            m_TotalSplats = total;
-
-            if (!splatPositions.IsCreated)
+            try
             {
-                Debug.LogError("Input splatPositions array is not created");
-                return;
-            }
+                Clear();
+
+                if (splatPositions.Length == 0)
+                {
+                    Debug.LogWarning("GaussianSplatOctree.Build: No splat positions provided");
+                    return;
+                }
+
+                Debug.Log($"Building octree with {splatPositions.Length} splats, bounds: {sceneBounds}");
+
+                int total = splatPositions.Length;
+                m_TotalSplats = total;
+
+                if (!splatPositions.IsCreated)
+                {
+                    Debug.LogError("Input splatPositions array is not created");
+                    return;
+                }
 
             // ============================================================================
             // PHASE 1: Parallel center of mass calculation using Burst
@@ -542,9 +554,14 @@ namespace GaussianSplatting.Runtime
                 init.Dispose();
             }
 
-            Debug.Log($"Octree build completed: {m_Nodes.Count} total nodes, others={m_OthersIndices.Length}");
+                Debug.Log($"Octree build completed: {m_Nodes.Count} total nodes, others={m_OthersIndices.Length}");
 
-            EnsureVisibleSplatIndicesCapacity(m_TotalSplats);
+                EnsureVisibleSplatIndicesCapacity(m_TotalSplats);
+            }
+            finally
+            {
+                m_IsBuilding = false;
+            }
         }
 
         /// <summary>
@@ -586,7 +603,6 @@ namespace GaussianSplatting.Runtime
 
             node.childIndices.Clear();
             node.isLeaf = false;
-            m_Nodes[nodeIndex] = node;
 
             // Create child bounds
             var childBounds = new Bounds[8];
@@ -680,10 +696,8 @@ namespace GaussianSplatting.Runtime
                 int childNodeIndex = m_Nodes.Count;
                 m_Nodes.Add(childNode);
 
-                // Register child index with parent
+                // Register child index with parent (node is a class reference, so this modifies the actual node)
                 node.childIndices.Add(childNodeIndex);
-                // Update parent reference in the global list (node is a reference type)
-                m_Nodes[nodeIndex] = node;
 
                 // Recursively build child only if it has splats (using array slice, no copy!)
                 if (childCount > 0)
