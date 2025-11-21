@@ -565,7 +565,8 @@ namespace GaussianSplatting.Runtime
                 for (int i = 0; i < count; i++)
                 {
                     int splatIdx = sortedIndices[startIdx + i];
-                    if ((uint)splatIdx < (uint)positions.Length)
+                    // Use m_AllPositionsNative instead of positions parameter for safe access
+                    if (m_AllPositionsNativeValid && (uint)splatIdx < (uint)m_AllPositionsNative.Length)
                     {
                         node.splatIndices.Add(splatIdx);
                     }
@@ -605,14 +606,27 @@ namespace GaussianSplatting.Runtime
             for (int i = 0; i < 8; i++)
                 childSplatsIdx[i] = new NativeList<int>(Allocator.Temp);
 
+            // Validate that we can still access positions safely
+            if (!m_AllPositionsNativeValid || !m_AllPositionsNative.IsCreated)
+            {
+                Debug.LogError("BuildRecursiveOptimizedAsync: m_AllPositionsNative is invalid during recursion");
+                // Cleanup temp lists before returning
+                for (int i = 0; i < 8; i++)
+                {
+                    childSplatsIdx[i].Dispose();
+                }
+                return;
+            }
+
             // Assign splats to child nodes based on position
+            // Use m_AllPositionsNative instead of positions parameter for safe access after await
             for (int ii = 0; ii < count; ii++)
             {
                 int splatIdx = sortedIndices[startIdx + ii];
-                if ((uint)splatIdx >= (uint)positions.Length)
+                if ((uint)splatIdx >= (uint)m_AllPositionsNative.Length)
                     continue;
 
-                float3 pos = positions[splatIdx];
+                float3 pos = m_AllPositionsNative[splatIdx];
 
                 int childIndex = 0;
                 if (pos.x > center.x) childIndex |= 1;
@@ -674,7 +688,7 @@ namespace GaussianSplatting.Runtime
                 // Recursively build child only if it has splats (using array slice, no copy!)
                 if (childCount > 0)
                 {
-                    await BuildRecursiveOptimizedAsync(childNodeIndex, depth + 1, sortedIndices, childStartIdx, childCount, positions);
+                    await BuildRecursiveOptimizedAsync(childNodeIndex, depth + 1, sortedIndices, childStartIdx, childCount, m_AllPositionsNative);
                 }
 
                 childStartIdx += childCount;
